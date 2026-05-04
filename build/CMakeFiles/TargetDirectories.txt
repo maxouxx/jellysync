@@ -1,0 +1,3 @@
+/home/maxime/JellySync/build/CMakeFiles/jellysync.app.dir
+/home/maxime/JellySync/build/CMakeFiles/edit_cache.dir
+/home/maxime/JellySync/build/CMakeFiles/rebuild_cache.dir

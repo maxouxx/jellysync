@@ -170,6 +170,9 @@ static int sync_run(SyncContext* ctx)
     AppState*  state = ctx->state;
     BgMode     mode  = ctx->mode;
 
+    // Disable WiFi power management before any network activity.
+    wifi_keepalive();
+
     // ── Mode téléchargement individuel ────────────────────────────────────────
     if (mode == BG_DOWNLOAD_ONE) {
         int idx = state->download_book_idx;
@@ -358,6 +361,7 @@ static int sync_run(SyncContext* ctx)
     }
 
     // ── Mode catalogue / sync complète ────────────────────────────────────────
+    wifi_keepalive();
     send_progress(state, 3, "Connexion au serveur...");
 
     JellyfinClient client;

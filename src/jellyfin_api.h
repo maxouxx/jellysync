@@ -101,6 +101,21 @@ static std::string _auth_header(const JellyfinClient& c)
     return h;
 }
 
+// Disable WiFi power management to prevent disconnects during transfers.
+static void wifi_keepalive()
+{
+    system("iwconfig wlan0 power off 2>/dev/null");
+}
+
+// Apply TCP keepalive settings to a curl handle so long-idle connections
+// don't get dropped by the router/NAT.
+static void _curl_set_keepalive(CURL* curl)
+{
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE,  1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE,   30L);  // first probe after 30s idle
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL,  10L);  // probe every 10s thereafter
+}
+
 static JFResult _do_get(const JellyfinClient& c, const std::string& ep,
                          MemBuffer& buf, long* code_out = nullptr)
 {
@@ -117,6 +132,7 @@ static JFResult _do_get(const JellyfinClient& c, const std::string& ep,
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,        30L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    _curl_set_keepalive(curl);
     CURLcode res = curl_easy_perform(curl);
     long code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
@@ -275,9 +291,10 @@ JFResult jf_get_books(const JellyfinClient& c,
     return JF_OK;
 }
 
-JFResult jf_download_book(const JellyfinClient& c, const JFBook& book,
-                            const char* dest,
-                            std::function<void(double,double)> prog)
+// Single download attempt — returns CURLE_OK / curl error code via res_out.
+static JFResult _download_once(const JellyfinClient& c, const JFBook& book,
+                                const char* dest,
+                                std::function<void(double,double)> prog)
 {
     FILE* f = fopen(dest, "wb");
     if (!f) return JF_ERR_IO;
@@ -294,9 +311,10 @@ JFResult jf_download_book(const JellyfinClient& c, const JFBook& book,
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, _progress_cb);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA,     &pd);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS,       0L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT,          300L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT,          600L);  // 10 min for large books
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,   1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER,   0L);
+    _curl_set_keepalive(curl);
     CURLcode res = curl_easy_perform(curl);
     long code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
@@ -305,6 +323,27 @@ JFResult jf_download_book(const JellyfinClient& c, const JFBook& book,
     fclose(f);
     if (res != CURLE_OK || code >= 400) { remove(dest); return JF_ERR_NETWORK; }
     return JF_OK;
+}
+
+JFResult jf_download_book(const JellyfinClient& c, const JFBook& book,
+                            const char* dest,
+                            std::function<void(double,double)> prog)
+{
+    // Re-disable WiFi power saving before every download attempt.
+    wifi_keepalive();
+
+    const int MAX_RETRIES = 3;
+    for (int attempt = 1; attempt <= MAX_RETRIES; ++attempt) {
+        JFResult r = _download_once(c, book, dest, prog);
+        if (r == JF_OK) return JF_OK;
+
+        if (attempt < MAX_RETRIES) {
+            // Wait, then wake WiFi back up before retrying.
+            sleep(3);
+            wifi_keepalive();
+        }
+    }
+    return JF_ERR_NETWORK;
 }
 
 #endif // JELLYFIN_API_IMPL
