@@ -1,11 +1,9 @@
 /**
- * JellySync v3 — Synchroniseur Jellyfin pour Vivlio Inkpad 3
+ * JellySync — Client Jellyfin pour Vivlio InkPad 3 / PocketBook
  *
- * Nouveautés v3 :
- *   • Affichage par dossiers (groupement automatique depuis le chemin serveur)
- *   • Téléchargement individuel d'un livre (bouton "↓ DL" sur chaque ligne)
- *   • Interface adaptive : toutes les dimensions sont calculées depuis
- *     ScreenWidth() / ScreenHeight() au moment du dessin
+ * Parcourt la bibliothèque de livres d'un serveur Jellyfin et télécharge
+ * à la demande les livres choisis (un livre, une sélection ou un dossier).
+ * Rien n'est jamais supprimé de la liseuse.
  */
 
 #include "inkview_compat.h"
@@ -20,31 +18,64 @@
 #include <algorithm>
 #include <cstdarg>
 #include <ctime>
+#include <deque>
+#include <string>
+#include <vector>
 
-// ─── Logging ──────────────────────────────────────────────────────────────────
-static FILE* g_log_file = NULL;
+// ─── Journal ──────────────────────────────────────────────────────────────────
+// Écrit dans /mnt/ext1/jellysync.log et garde les dernières lignes en mémoire
+// pour le panneau « Journal détaillé » affiché pendant les téléchargements.
+static FILE*                   g_log_file = NULL;
+static pthread_mutex_t         g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static std::deque<std::string> g_log_lines;
+static std::string             g_log_pending;
+static unsigned                g_log_seq = 0;
+static const size_t            LOG_KEEP  = 64;
 
 static void log_init()
 {
-    g_log_file = fopen("/mnt/ext1/jellysync.log", "a");
-    if (!g_log_file) {
-        g_log_file = fopen("/tmp/jellysync.log", "a");
-    }
+    g_log_file = fopen(FLASHDIR "/jellysync.log", "a");
+    if (!g_log_file) g_log_file = fopen("/tmp/jellysync.log", "a");
     if (g_log_file) {
         time_t now = time(NULL);
-        fprintf(g_log_file, "\n--- JellySync started at %s ---\n", ctime(&now));
+        fprintf(g_log_file, "\n--- JellySync démarré le %s", ctime(&now));
         fflush(g_log_file);
     }
 }
 
 static void log_write(const char* fmt, ...)
 {
-    if (!g_log_file) return;
+    char buf[1024];
     va_list args;
     va_start(args, fmt);
-    vfprintf(g_log_file, fmt, args);
+    vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    fflush(g_log_file);
+
+    pthread_mutex_lock(&g_log_mutex);
+    if (g_log_file) { fputs(buf, g_log_file); fflush(g_log_file); }
+    for (const char* p = buf; *p; ++p) {
+        if (*p != '\n') { g_log_pending += *p; continue; }
+        time_t now = time(NULL);
+        char ts[16];
+        strftime(ts, sizeof(ts), "%H:%M:%S ", localtime(&now));
+        g_log_lines.push_back(ts + g_log_pending);
+        if (g_log_lines.size() > LOG_KEEP) g_log_lines.pop_front();
+        g_log_pending.clear();
+        g_log_seq++;
+    }
+    pthread_mutex_unlock(&g_log_mutex);
+}
+
+static unsigned log_tail(std::vector<std::string>& out, int max_lines)
+{
+    pthread_mutex_lock(&g_log_mutex);
+    out.clear();
+    int n = std::min((int)g_log_lines.size(), max_lines);
+    for (int i = (int)g_log_lines.size() - n; i < (int)g_log_lines.size(); ++i)
+        out.push_back(g_log_lines[i]);
+    unsigned seq = g_log_seq;
+    pthread_mutex_unlock(&g_log_mutex);
+    return seq;
 }
 
 static void log_close()
@@ -80,36 +111,21 @@ static void* bg_thread_func(void* arg);
 int main(void)
 {
     log_init();
-    log_write("main() started\n");
-    
     curl_global_init(CURL_GLOBAL_ALL);
-    log_write("curl_global_init done\n");
-    
+
     mkdir(FLASHDIR "/books", 0755);
     mkdir(BOOKS_DIR, 0755);
-    log_write("directories created\n");
 
     config_load(CONFIG_FILE, &g_config);
-    log_write("config loaded: server_url='%s'\n", g_config.server_url);
+    log_write("JellySync %s, serveur : %s\n", APP_VERSION,
+              g_config.server_url[0] ? g_config.server_url : "(aucun)");
 
-    // Use placement new to properly construct C++ STL objects in AppState
+    // Placement new : AppState contient des objets STL
     new (&g_state) AppState();
-    log_write("AppState constructed with placement new\n");
-    
-    g_state.screen           = g_config.server_url[0] ? SCREEN_MAIN : SCREEN_SETUP;
-    g_state.catalog_loaded   = false;
-    g_state.filter           = 0;
+    g_state.screen            = g_config.server_url[0] ? SCREEN_MAIN : SCREEN_SETUP;
     g_state.download_book_idx = -1;
-    g_state.download_progress = 0;
-    g_state.dl_bytes_now      = 0;
-    g_state.dl_bytes_total    = 0;
-    g_state.wifi_connected    = false;
-    g_state.server_connected  = false;
-    g_state.local_book_count  = 0;
-    log_write("state initialized, screen=%d\n", g_state.screen);
 
     InkViewMain(main_handler);
-    log_write("InkViewMain returned\n");
 
     cleanup_fonts();
     curl_global_cleanup();
@@ -120,92 +136,53 @@ int main(void)
 // ─── Gestionnaire d'événements ────────────────────────────────────────────────
 static int main_handler(int event, int par1, int par2)
 {
-    log_write("main_handler: event=%d, par1=%d, par2=%d\n", event, par1, par2);
-    
     switch (event)
     {
         case EVT_INIT:
-            log_write("EVT_INIT: calling ui_init\n");
             ui_init(&g_config, &g_state);
-            log_write("EVT_INIT: ui_init done, calling ui_draw\n");
+            if (g_state.screen == SCREEN_SETUP) g_cfg_backup = g_config;
             ui_draw(&g_config, &g_state);
-            log_write("EVT_INIT: ui_draw done\n");
-            if (g_config.server_url[0]) {
-                log_write("EVT_INIT: starting background catalog\n");
+            if (g_config.server_url[0])
                 start_background(BG_CATALOG);
-            }
-            log_write("EVT_INIT: completed\n");
             return 1;
 
         case EVT_SHOW:
         case EVT_REPAINT:
-            log_write("EVT_SHOW/REPAINT: calling ui_draw\n");
             ui_draw(&g_config, &g_state);
-            log_write("EVT_SHOW/REPAINT: ui_draw done\n");
             return 1;
 
         case EVT_POINTERUP:
             ui_handle_tap(par1, par2, &g_config, &g_state,
                 []{ start_background(BG_CATALOG); },
-                []{ start_background(BG_SYNC);    },
-                []{ CloseApp();                   },
                 [](int idx){ start_download_one(idx); },
                 [](const std::string& f){ start_download_folder(f); },
                 []{ start_download_selected(); });
             return 1;
 
         case EVT_KEYPRESS:
-            if (par1 == KEY_POWER || par1 == KEY_BACK) {
-                if (!g_state.syncing) {
-                    // Retour à la vue dossiers si dans un dossier
-                    if (!g_state.selected_folder.empty()) {
-                        g_state.selected_folder = "";
-                        g_state.list_scroll     = 0;
-                        ui_draw(&g_config, &g_state);
-                    } else {
-                        CloseApp();
-                    }
-                }
+            if (par1 == KEY_BACK || par1 == KEY_POWER) {
+                if (!ui_back(&g_config, &g_state) && !g_state.syncing)
+                    CloseApp();
             }
-            if (par1 == KEY_PREV) {
-                if (g_state.list_scroll > 0) {
-                    g_state.list_scroll -= std::max(1, g_state.list_visible);
-                    if (g_state.list_scroll < 0) g_state.list_scroll = 0;
-                    ui_draw(&g_config, &g_state);
-                }
-            }
-            if (par1 == KEY_NEXT) {
-                int total = get_filtered_count(&g_state);
-                int max_s = std::max(0, total - g_state.list_visible);
-                if (g_state.list_scroll < max_s) {
-                    g_state.list_scroll += std::max(1, g_state.list_visible);
-                    if (g_state.list_scroll > max_s) g_state.list_scroll = max_s;
-                    ui_draw(&g_config, &g_state);
-                }
-            }
+            else if (par1 == KEY_PREV) ui_page(&g_config, &g_state, -1);
+            else if (par1 == KEY_NEXT) ui_page(&g_config, &g_state, +1);
             return 1;
 
         case EVT_CUSTOM:
             if (par1 == MSG_SYNC_PROGRESS || par1 == MSG_DOWNLOAD_PROGRESS) {
-                g_state.progress         = par2;
-                g_state.download_progress = par2;
-                ui_draw_partial(&g_config, &g_state);
+                g_state.progress = par2;
+                ui_progress(&g_config, &g_state);
             }
             else if (par1 == MSG_CATALOG_READY || par1 == MSG_SYNC_DONE ||
-                     par1 == MSG_DOWNLOAD_DONE) {
+                     par1 == MSG_DOWNLOAD_DONE || par1 == MSG_CATALOG_ERROR ||
+                     par1 == MSG_SYNC_ERROR    || par1 == MSG_DOWNLOAD_ERROR) {
+                pthread_join(g_thread, nullptr);
                 g_state.syncing  = false;
                 g_state.progress = 100;
-                if (par1 == MSG_DOWNLOAD_DONE || par1 == MSG_SYNC_DONE) {
-                    g_state.selected_folder = "";
-                    g_state.list_scroll     = 0;
+                if (par1 == MSG_CATALOG_READY || par1 == MSG_CATALOG_ERROR) {
+                    g_state.in_folder   = false;
+                    g_state.list_scroll = 0;
                 }
-                pthread_join(g_thread, nullptr);
-                ui_draw(&g_config, &g_state);
-            }
-            else if (par1 == MSG_CATALOG_ERROR || par1 == MSG_SYNC_ERROR ||
-                     par1 == MSG_DOWNLOAD_ERROR) {
-                g_state.syncing = false;
-                pthread_join(g_thread, nullptr);
                 ui_draw(&g_config, &g_state);
             }
             return 1;
@@ -214,78 +191,52 @@ static int main_handler(int event, int par1, int par2)
 }
 
 // ─── Thread de fond ───────────────────────────────────────────────────────────
+static void begin_background(BgMode mode, const char* msg)
+{
+    g_state.syncing        = true;
+    g_state.bg_mode        = mode;
+    g_state.progress       = 0;
+    g_state.error_msg[0]   = 0;
+    g_state.dl_index       = 0;
+    g_state.dl_total       = 0;
+    g_state.dl_bytes_now   = 0;
+    g_state.dl_bytes_total = 0;
+    g_state.downloaded     = 0;
+    g_state.dl_errors      = 0;
+    snprintf(g_state.status_msg, sizeof(g_state.status_msg), "%s", msg);
+    ui_draw(&g_config, &g_state);
+    pthread_create(&g_thread, nullptr, bg_thread_func, (void*)(intptr_t)mode);
+}
+
 static void start_background(BgMode mode)
 {
-    log_write("start_background: mode=%d\n", mode);
-    
-    if (g_state.syncing) {
-        log_write("start_background: already syncing, ignoring\n");
-        return;
-    }
-    config_save(CONFIG_FILE, &g_config);
-    log_write("start_background: config saved\n");
-    
-    g_state.syncing      = true;
-    g_state.bg_mode      = mode;
-    g_state.progress     = 0;
-    g_state.error_msg[0] = 0;
-    snprintf(g_state.status_msg, sizeof(g_state.status_msg),
-             mode == BG_CATALOG ? "Chargement..." : "Connexion...");
-    log_write("start_background: state updated, status='%s'\n", g_state.status_msg);
-    
-    ui_draw(&g_config, &g_state);
-    log_write("start_background: ui_draw done\n");
-    
-    pthread_create(&g_thread, nullptr, bg_thread_func, (void*)(intptr_t)mode);
-    log_write("start_background: thread created\n");
+    if (g_state.syncing) return;
+    log_write("Chargement de la bibliothèque\n");
+    begin_background(mode, "Connexion...");
 }
 
 static void start_download_one(int catalog_idx)
 {
     if (g_state.syncing) return;
     if (catalog_idx < 0 || catalog_idx >= (int)g_state.catalog.size()) return;
-
-    g_state.syncing           = true;
-    g_state.bg_mode           = BG_DOWNLOAD_ONE;
-    g_state.progress          = 0;
-    g_state.download_progress = 0;
     g_state.download_book_idx = catalog_idx;
-    g_state.error_msg[0]      = 0;
-
-    const std::string& name = g_state.catalog[catalog_idx].name;
-    snprintf(g_state.status_msg, sizeof(g_state.status_msg),
-             "Préparation : %s", name.substr(0, 40).c_str());
-    ui_draw(&g_config, &g_state);
-    pthread_create(&g_thread, nullptr, bg_thread_func, (void*)(intptr_t)BG_DOWNLOAD_ONE);
+    log_write("Demande : télécharger « %s »\n", g_state.catalog[catalog_idx].name.c_str());
+    begin_background(BG_DOWNLOAD_ONE, "Préparation...");
 }
 
 static void start_download_folder(const std::string& folder)
 {
     if (g_state.syncing) return;
     g_state.download_folder_name = folder;
-    g_state.syncing      = true;
-    g_state.bg_mode      = BG_DOWNLOAD_FOLDER;
-    g_state.progress     = 0;
-    g_state.error_msg[0] = 0;
-    snprintf(g_state.status_msg, sizeof(g_state.status_msg),
-             "Préparation : %s", folder.substr(0, 40).c_str());
-    config_save(CONFIG_FILE, &g_config);
-    ui_draw(&g_config, &g_state);
-    pthread_create(&g_thread, nullptr, bg_thread_func, (void*)(intptr_t)BG_DOWNLOAD_FOLDER);
+    log_write("Demande : nouveaux livres du dossier « %s »\n", folder.c_str());
+    begin_background(BG_DOWNLOAD_FOLDER, "Préparation...");
 }
 
 static void start_download_selected()
 {
     if (g_state.syncing || g_state.selected_ids.empty()) return;
-    g_state.syncing      = true;
-    g_state.bg_mode      = BG_DOWNLOAD_SELECTED;
-    g_state.progress     = 0;
-    g_state.error_msg[0] = 0;
-    snprintf(g_state.status_msg, sizeof(g_state.status_msg),
-             "Téléchargement de %d livre(s)...", (int)g_state.selected_ids.size());
-    config_save(CONFIG_FILE, &g_config);
-    ui_draw(&g_config, &g_state);
-    pthread_create(&g_thread, nullptr, bg_thread_func, (void*)(intptr_t)BG_DOWNLOAD_SELECTED);
+    log_write("Demande : %d livre(s) sélectionné(s)\n", (int)g_state.selected_ids.size());
+    begin_background(BG_DOWNLOAD_SELECTED, "Préparation...");
 }
 
 static void* bg_thread_func(void* arg)
@@ -304,12 +255,7 @@ static void* bg_thread_func(void* arg)
             ok_msg  = MSG_DOWNLOAD_DONE;
             err_msg = MSG_DOWNLOAD_ERROR;
             break;
-        case BG_DOWNLOAD_FOLDER:
-        case BG_DOWNLOAD_SELECTED:
-            ok_msg  = MSG_SYNC_DONE;
-            err_msg = MSG_SYNC_ERROR;
-            break;
-        default: // BG_SYNC
+        default: // BG_DOWNLOAD_FOLDER, BG_DOWNLOAD_SELECTED
             ok_msg  = MSG_SYNC_DONE;
             err_msg = MSG_SYNC_ERROR;
             break;

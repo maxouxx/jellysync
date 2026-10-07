@@ -194,19 +194,22 @@ JellySync/
 ## Utilisation
 
 1. Lancez **JellySync** depuis le lanceur d'applications
-2. Écran **Configuration** : saisissez l'URL Jellyfin + identifiants ou clé API
-3. Appuyez **Refresh** — la liste de tous vos dossiers s'affiche
-4. **Vue dossiers** :
-   - Appuyez sur un dossier pour voir les livres qu'il contient
-   - Appuyez **⬇ Tout** pour télécharger tous les nouveaux livres du dossier
-5. **Vue livres** (dans un dossier) :
-   - Case à cocher à gauche : sélectionnez plusieurs livres
-   - Bouton **⬇ DL** sur la ligne : télécharge ce livre immédiatement
-   - Quand des livres sont cochés, le bouton **DL (N)** apparaît en haut à droite
-   - **Annuler** efface la sélection
-6. **Sync** télécharge tous les nouveaux/mis à jour de toute la bibliothèque
-7. Statuts :
-   - **N** = Nouveau sur le serveur
-   - **M** = Mis à jour
-   - **✓** = Déjà présent
-   - **?** = Local seulement (pas sur le serveur)
+2. **Réglages** : saisissez l'adresse du serveur Jellyfin, puis choisissez
+   **Identifiants** (utilisateur + mot de passe) ou **Clé API**
+3. La bibliothèque se charge au démarrage ; **Actualiser** la recharge
+4. **Accueil** : la liste des dossiers, avec le nombre de nouveaux livres de chacun.
+   Touchez un dossier pour l'ouvrir
+5. **Dans un dossier** :
+   - Le bouton à droite d'un livre le télécharge tout de suite
+   - Touchez la ligne d'un livre pour le cocher ; la barre du bas propose alors
+     **Télécharger** pour toute la sélection
+   - **Tout télécharger** (bandeau du haut) récupère tous les nouveaux livres du dossier
+6. Onglets : **Tous**, **Nouveaux** (absents ou mis à jour sur le serveur),
+   **Sur la liseuse**
+7. Les listes sont paginées : boutons **Précédent / Suivant** ou touches de page
+   de la liseuse. La touche Retour remonte d'un niveau
+8. Pendant un téléchargement, le bas de l'écran affiche le journal détaillé
+   (requêtes, tailles, vitesses, erreurs). Le journal complet est aussi écrit
+   dans `/mnt/ext1/jellysync.log`
+
+JellySync ne fait que télécharger : il ne supprime jamais de livre de la liseuse.
