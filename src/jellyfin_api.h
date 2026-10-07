@@ -116,6 +116,8 @@ static void _curl_set_keepalive(CURL* curl)
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL,  10L);  // probe every 10s thereafter
 }
 
+extern void log_write(const char* fmt, ...);
+
 static JFResult _do_get(const JellyfinClient& c, const std::string& ep,
                          MemBuffer& buf, long* code_out = nullptr)
 {
@@ -133,13 +135,20 @@ static JFResult _do_get(const JellyfinClient& c, const std::string& ep,
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     _curl_set_keepalive(curl);
+    log_write("GET %s\n", ep.c_str());
     CURLcode res = curl_easy_perform(curl);
     long code = 0;
+    double secs = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &secs);
     if (code_out) *code_out = code;
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);
-    if (res != CURLE_OK) return JF_ERR_NETWORK;
+    if (res != CURLE_OK) {
+        log_write("  erreur réseau : %s\n", curl_easy_strerror(res));
+        return JF_ERR_NETWORK;
+    }
+    log_write("  HTTP %ld, %zu octets, %.2f s\n", code, buf.data.size(), secs);
     if (code == 401)     return JF_ERR_AUTH;
     if (code >= 400)     return JF_ERR_HTTP;
     return JF_OK;
@@ -181,6 +190,7 @@ JFResult jf_authenticate(JellyfinClient& client,
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,        15L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
 
+    log_write("POST /Users/AuthenticateByName (utilisateur « %s »)\n", user);
     CURLcode res = curl_easy_perform(curl);
     long code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
@@ -188,7 +198,11 @@ JFResult jf_authenticate(JellyfinClient& client,
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK) return JF_ERR_NETWORK;
+    if (res != CURLE_OK) {
+        log_write("  erreur réseau : %s\n", curl_easy_strerror(res));
+        return JF_ERR_NETWORK;
+    }
+    log_write("  HTTP %ld\n", code);
     if (code == 401)     return JF_ERR_AUTH;
     if (code >= 400)     return JF_ERR_HTTP;
 
@@ -315,13 +329,26 @@ static JFResult _download_once(const JellyfinClient& c, const JFBook& book,
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,   1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER,   0L);
     _curl_set_keepalive(curl);
+    log_write("GET /Items/%s/Download\n", book.id.c_str());
     CURLcode res = curl_easy_perform(curl);
     long code = 0;
+    double secs = 0, speed = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &secs);
+    curl_easy_getinfo(curl, CURLINFO_SPEED_DOWNLOAD, &speed);
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);
     fclose(f);
-    if (res != CURLE_OK || code >= 400) { remove(dest); return JF_ERR_NETWORK; }
+    if (res != CURLE_OK) {
+        log_write("  erreur réseau : %s\n", curl_easy_strerror(res));
+        remove(dest); return JF_ERR_NETWORK;
+    }
+    if (code >= 400) {
+        log_write("  refusé par le serveur : HTTP %ld\n", code);
+        remove(dest); return JF_ERR_NETWORK;
+    }
+    log_write("  HTTP %ld en %.1f s (%.0f Ko/s)\n", code, secs, speed / 1024.0);
+    log_write("  écrit : %s\n", dest);
     return JF_OK;
 }
 
@@ -338,11 +365,14 @@ JFResult jf_download_book(const JellyfinClient& c, const JFBook& book,
         if (r == JF_OK) return JF_OK;
 
         if (attempt < MAX_RETRIES) {
+            log_write("  tentative %d/%d échouée, nouvel essai dans 3 s\n",
+                      attempt, MAX_RETRIES);
             // Wait, then wake WiFi back up before retrying.
             sleep(3);
             wifi_keepalive();
         }
     }
+    log_write("  abandon après %d tentatives\n", MAX_RETRIES);
     return JF_ERR_NETWORK;
 }
 

@@ -26,7 +26,6 @@ enum Screen {
 // ─── Mode du thread de fond ───────────────────────────────────────────────────
 enum BgMode {
     BG_CATALOG,
-    BG_SYNC,
     BG_DOWNLOAD_ONE,
     BG_DOWNLOAD_FOLDER,    // télécharger tous les nouveaux d'un dossier
     BG_DOWNLOAD_SELECTED,  // télécharger les livres sélectionnés
@@ -37,7 +36,6 @@ enum BookStatus {
     BOOK_SYNCED,
     BOOK_NEW,
     BOOK_UPDATED,
-    BOOK_LOCAL_ONLY,
     BOOK_DOWNLOADING,
     BOOK_ERROR,
 };
@@ -61,7 +59,7 @@ struct AppConfig {
     char password[128];
     char api_key[256];
     char library_id[128];
-    int  delete_local;
+    int  auth_mode;       // 0 = identifiants, 1 = clé API
     char books_dir[512];
     int  lang;            // 0 = Français, 1 = English
 };
@@ -85,15 +83,17 @@ struct AppState {
 
     // Compteurs sync
     int  downloaded;
-    int  skipped;
-    int  deleted;
+    int  dl_errors;
+    int  dl_index;          // livre en cours (1..dl_total)
+    int  dl_total;          // nombre de livres du lot en cours
 
     // Navigation
     int  list_scroll;
     int  list_visible;
-    int  filter;            // 0=Tous 1=Nouveaux 2=Présents 3=Local
+    int  filter;            // 0=Tous 1=Nouveaux 2=Sur la liseuse
 
-    // Dossier sélectionné ("" = vue tous dossiers)
+    // Dossier ouvert (in_folder) ; "" désigne les livres sans dossier
+    bool        in_folder;
     std::string selected_folder;
 
     // Téléchargement individuel
@@ -119,7 +119,7 @@ struct AppState {
 static void config_load(const char* path, AppConfig* cfg)
 {
     memset(cfg, 0, sizeof(AppConfig));
-    cfg->delete_local = 0;
+    bool has_auth_mode = false;
     snprintf(cfg->books_dir, sizeof(cfg->books_dir), FLASHDIR "/books/Jellyfin");
 
     FILE* f = fopen(path, "r");
@@ -139,11 +139,13 @@ static void config_load(const char* path, AppConfig* cfg)
         else if (strcmp(key, "password")    == 0) strncpy(cfg->password,    val, 127);
         else if (strcmp(key, "api_key")     == 0) strncpy(cfg->api_key,     val, 255);
         else if (strcmp(key, "library_id")  == 0) strncpy(cfg->library_id,  val, 127);
-        else if (strcmp(key, "delete_local")== 0) cfg->delete_local = atoi(val);
+        else if (strcmp(key, "auth_mode")   == 0) { cfg->auth_mode = atoi(val); has_auth_mode = true; }
         else if (strcmp(key, "books_dir")   == 0) strncpy(cfg->books_dir,   val, 511);
         else if (strcmp(key, "lang")        == 0) cfg->lang = atoi(val);
     }
     fclose(f);
+    // Anciennes configs : la clé API, si présente, était prioritaire
+    if (!has_auth_mode) cfg->auth_mode = cfg->api_key[0] ? 1 : 0;
 }
 
 static void config_save(const char* path, const AppConfig* cfg)
@@ -155,7 +157,7 @@ static void config_save(const char* path, const AppConfig* cfg)
     fprintf(f, "password=%s\n",     cfg->password);
     fprintf(f, "api_key=%s\n",      cfg->api_key);
     fprintf(f, "library_id=%s\n",   cfg->library_id);
-    fprintf(f, "delete_local=%d\n", cfg->delete_local);
+    fprintf(f, "auth_mode=%d\n",    cfg->auth_mode);
     fprintf(f, "books_dir=%s\n",    cfg->books_dir);
     fprintf(f, "lang=%d\n",         cfg->lang);
     fclose(f);

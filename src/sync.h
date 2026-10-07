@@ -1,13 +1,15 @@
 #pragma once
 /**
- * sync.h — Moteur de synchronisation JellySync v3
+ * sync.h — Catalogue et téléchargements JellySync
  *
  * Modes :
- *   BG_CATALOG      → auth + catalogue + comparaison locale (pas de DL)
- *   BG_SYNC         → catalogue + téléchargement de tous les nouveaux/modifiés
+ *   BG_CATALOG           → auth + catalogue + comparaison avec la liseuse
  *   BG_DOWNLOAD_ONE      → téléchargement d'un seul livre
- *   BG_DOWNLOAD_FOLDER   → téléchargement de tous les nouveaux d'un dossier
+ *   BG_DOWNLOAD_FOLDER   → téléchargement des nouveaux livres d'un dossier
  *   BG_DOWNLOAD_SELECTED → téléchargement des livres sélectionnés
+ *
+ * Rien n'est jamais supprimé de la liseuse : on ne télécharge que ce
+ * que l'utilisateur demande.
  */
 
 #include "inkview_compat.h"
@@ -88,121 +90,112 @@ static void send_progress(AppState* state, int pct, const char* msg)
     usleep(40000);
 }
 
-static std::map<std::string, long long> list_local_files(const char* dir)
+// Fichiers déjà sur la liseuse, indexés par chemin relatif à books_dir :
+// "livre.epub" (racine) ou "Dossier/livre.epub" (un niveau de sous-dossier,
+// là où les téléchargements sont rangés).
+static void list_local_files_in(const std::string& dir, const std::string& prefix,
+                                std::map<std::string, long long>& files, int depth)
 {
-    std::map<std::string, long long> files;
-    DIR* d = opendir(dir);
-    if (!d) return files;
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
     struct dirent* e;
     while ((e = readdir(d)) != nullptr) {
         if (e->d_name[0] == '.') continue;
-        std::string full = std::string(dir) + "/" + e->d_name;
+        std::string full = dir + "/" + e->d_name;
         struct stat st;
-        long long sz = 0;
-        if (stat(full.c_str(), &st) == 0) sz = st.st_size;
-        files[e->d_name] = sz;
+        if (stat(full.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (depth > 0)
+                list_local_files_in(full, prefix + e->d_name + "/", files, depth - 1);
+        } else {
+            files[prefix + e->d_name] = st.st_size;
+        }
     }
     closedir(d);
+}
+
+static std::map<std::string, long long> list_local_files(const char* dir)
+{
+    std::map<std::string, long long> files;
+    list_local_files_in(dir, "", files, 1);
     return files;
 }
 
-// ─── Expose pour main.cpp (scroll touches physiques) ─────────────────────────
-// Compte les éléments de la liste aplatie (en-têtes de dossiers + livres)
-// en tenant compte du filtre et du dossier sélectionné.
-static int get_filtered_count(const AppState* state)
+static std::string local_path_for(const AppConfig* cfg, const BookEntry& e)
 {
-    // Si un dossier est sélectionné, on compte seulement ses livres
-    if (!state->selected_folder.empty()) {
-        int count = 0;
-        for (auto& b : state->catalog) {
-            if (b.folder != state->selected_folder) continue;
-            switch (state->filter) {
-                case 0: count++; break;
-                case 1: if (b.status==BOOK_NEW||b.status==BOOK_UPDATED) count++; break;
-                case 2: if (b.status==BOOK_SYNCED||b.status==BOOK_DOWNLOADING) count++; break;
-                case 3: if (b.status==BOOK_LOCAL_ONLY) count++; break;
-            }
-        }
-        return count;
-    }
-
-    // Vue dossiers : on compte les en-têtes de dossier (1 par dossier distinct)
-    // + les livres sans dossier
-    std::set<std::string> folders;
-    int no_folder = 0;
-    for (auto& b : state->catalog) {
-        bool match = false;
-        switch (state->filter) {
-            case 0: match = true; break;
-            case 1: match = (b.status==BOOK_NEW||b.status==BOOK_UPDATED); break;
-            case 2: match = (b.status==BOOK_SYNCED||b.status==BOOK_DOWNLOADING); break;
-            case 3: match = (b.status==BOOK_LOCAL_ONLY); break;
-        }
-        if (!match) continue;
-        if (b.folder.empty()) no_folder++;
-        else folders.insert(b.folder);
-    }
-    return (int)folders.size() + no_folder;
+    std::string dir = cfg->books_dir;
+    if (!e.folder.empty()) dir += "/" + e.folder;
+    return dir + "/" + e.filename;
 }
 
 // ─── Authentification réutilisable ────────────────────────────────────────────
 static JFResult sync_authenticate(AppConfig* cfg, AppState* state, JellyfinClient& client)
 {
     JFResult r;
-    if (cfg->api_key[0])
+    if (cfg->auth_mode == 1) {
+        log_write("Authentification par clé API sur %s\n", cfg->server_url);
         r = jf_set_api_key(client, cfg->server_url, cfg->api_key);
-    else
+    } else {
+        log_write("Authentification de « %s » sur %s\n", cfg->username, cfg->server_url);
         r = jf_authenticate(client, cfg->server_url, cfg->username, cfg->password);
+    }
 
     if (r == JF_OK) {
         strncpy(state->token,   client.token.c_str(),   sizeof(state->token)-1);
         strncpy(state->user_id, client.user_id.c_str(), sizeof(state->user_id)-1);
         state->wifi_connected   = true;
         state->server_connected = true;
+        log_write("Connecté au serveur\n");
+    } else {
+        state->server_connected = false;
+        log_write("Échec de connexion (code %d)\n", (int)r);
     }
     return r;
 }
 
-// ─── Moteur principal ─────────────────────────────────────────────────────────
-static int sync_run(SyncContext* ctx)
+static const char* stx(const AppConfig* cfg, const char* fr, const char* en)
 {
-    AppConfig* cfg   = ctx->config;
-    AppState*  state = ctx->state;
-    BgMode     mode  = ctx->mode;
+    return cfg->lang == 1 ? en : fr;
+}
 
-    // Disable WiFi power management before any network activity.
-    wifi_keepalive();
+// ─── Téléchargement d'une liste de livres ─────────────────────────────────────
+static int download_entries(AppConfig* cfg, AppState* state, const std::vector<int>& to_dl)
+{
+    send_progress(state, 2, "Connexion...");
+    JellyfinClient client;
+    JFResult r = sync_authenticate(cfg, state, client);
+    if (r == JF_ERR_AUTH) {
+        snprintf(state->error_msg, sizeof(state->error_msg), "%s",
+                 stx(cfg, "Identifiants refusés par le serveur.", "The server rejected the credentials."));
+        return SYNC_ERR_AUTH;
+    }
+    if (r != JF_OK) {
+        snprintf(state->error_msg, sizeof(state->error_msg),
+                 stx(cfg, "Impossible de joindre %s", "Cannot reach %s"), cfg->server_url);
+        return SYNC_ERR_NETWORK;
+    }
 
-    // ── Mode téléchargement individuel ────────────────────────────────────────
-    if (mode == BG_DOWNLOAD_ONE) {
-        int idx = state->download_book_idx;
-        if (idx < 0 || idx >= (int)state->catalog.size())
-            return SYNC_ERR_IO;
+    int total_dl = (int)to_dl.size();
+    state->downloaded = 0;
+    state->dl_errors  = 0;
+    state->dl_total   = total_dl;
+    log_write("%d livre(s) à télécharger\n", total_dl);
 
-        BookEntry& entry = state->catalog[idx];
-        send_progress(state, 5, ("Connexion pour : " + entry.name.substr(0,40)).c_str());
+    if (total_dl == 0) {
+        snprintf(state->status_msg, sizeof(state->status_msg), "Rien à télécharger.");
+        return SYNC_OK;
+    }
 
-        JellyfinClient client;
-        JFResult r = sync_authenticate(cfg, state, client);
-        if (r == JF_ERR_AUTH) {
-            snprintf(state->error_msg, sizeof(state->error_msg),
-                     "Erreur d'authentification.");
-            return SYNC_ERR_AUTH;
-        }
-        if (r != JF_OK) {
-            snprintf(state->error_msg, sizeof(state->error_msg),
-                     "Impossible de joindre le serveur.");
-            return SYNC_ERR_NETWORK;
-        }
+    for (int di = 0; di < total_dl; ++di) {
+        BookEntry& entry = state->catalog[to_dl[di]];
+        state->dl_index = di + 1;
+        int base_pct = (int)(100.0 * di / total_dl);
 
-        send_progress(state, 20, ("Téléchargement : " + entry.name.substr(0,40)).c_str());
-
-        std::string dest_dir = std::string(cfg->books_dir);
+        std::string dest = local_path_for(cfg, entry);
         if (!entry.folder.empty()) {
-            dest_dir += "/" + entry.folder;
-            mkdir(dest_dir.c_str(), 0755);
+            std::string dir = std::string(cfg->books_dir) + "/" + entry.folder;
+            if (mkdir(dir.c_str(), 0755) == 0) log_write("Dossier créé : %s\n", dir.c_str());
         }
-        std::string dest = dest_dir + "/" + entry.filename;
         entry.status = BOOK_DOWNLOADING;
 
         JFBook book;
@@ -211,186 +204,92 @@ static int sync_run(SyncContext* ctx)
         book.path      = entry.remote_path;
         book.file_size = entry.remote_size;
 
-        state->dl_book_name  = entry.name;
-        state->dl_bytes_now  = 0;
-        state->dl_bytes_total= entry.remote_size;
-        log_write("[DL_ONE] Début : %s → %s (taille: %lld)\n",
-                  entry.name.c_str(), dest.c_str(), entry.remote_size);
+        state->dl_book_name   = entry.name;
+        state->dl_bytes_now   = 0;
+        state->dl_bytes_total = entry.remote_size;
+        log_write("[%d/%d] %s (%lld octets annoncés)\n", di + 1, total_dl,
+                  entry.name.c_str(), entry.remote_size);
+        send_progress(state, base_pct, nullptr);
 
+        int last_logged = -1;
         r = jf_download_book(client, book, dest.c_str(),
             [&](double done, double total) {
                 double effective = (total > 0) ? total
                                  : (book.file_size > 0 ? (double)book.file_size : 0);
-                int pct = (effective > 0) ? (int)(20.0 + 78.0 * done / effective) : 50;
-                state->dl_bytes_now  = (long long)done;
-                state->dl_bytes_total= (long long)effective;
-                if (pct != state->download_progress) {
-                    state->download_progress = pct;
-                    log_write("[DL_ONE] %.0f / %.0f octets — %d%%\n", done, effective, pct);
+                state->dl_bytes_now   = (long long)done;
+                state->dl_bytes_total = (long long)effective;
+                int book_pct = (effective > 0) ? (int)(done / effective * 100) : 0;
+                int pct = base_pct + (int)(100.0 / total_dl * book_pct / 100);
+                if (book_pct / 10 != last_logged && done > 0) {
+                    last_logged = book_pct / 10;
+                    log_write("  %.0f / %.0f octets (%d %%)\n", done, effective, book_pct);
+                }
+                if (book_pct != state->download_progress) {
+                    state->download_progress = book_pct;
                     SendEvent(GetCurrentTask(), EVT_CUSTOM, MSG_DOWNLOAD_PROGRESS, pct);
                 }
             });
 
-        state->dl_book_name.clear();
         if (r == JF_OK) {
             entry.status = BOOK_SYNCED;
             struct stat st;
             if (stat(dest.c_str(), &st) == 0) entry.local_size = st.st_size;
             state->downloaded++;
-            log_write("[DL_ONE] OK — %lld octets sur disque\n", entry.local_size);
-            SendGlobalEvent(EVT_BOOKLIST_UPDATED, 0, 0);
-            snprintf(state->status_msg, sizeof(state->status_msg),
-                     "Téléchargé : %s", entry.name.substr(0,40).c_str());
+            state->local_book_count++;
+            if (state->new_count > 0) state->new_count--;
+            log_write("[%d/%d] terminé, %lld octets sur la liseuse\n",
+                      di + 1, total_dl, entry.local_size);
         } else {
             entry.status = BOOK_ERROR;
-            log_write("[DL_ONE] ERREUR (code=%d)\n", (int)r);
-            snprintf(state->error_msg, sizeof(state->error_msg),
-                     "Échec téléchargement : %s", entry.name.substr(0,40).c_str());
+            state->dl_errors++;
+            log_write("[%d/%d] ÉCHEC (code %d)\n", di + 1, total_dl, (int)r);
         }
-        send_progress(state, 100, state->status_msg);
-        return (r == JF_OK) ? SYNC_OK : SYNC_ERR_NETWORK;
+        state->selected_ids.erase(entry.jf_id);
     }
+    state->dl_book_name.clear();
 
-    // ── Mode téléchargement dossier ou sélection ──────────────────────────────
-    if (mode == BG_DOWNLOAD_FOLDER || mode == BG_DOWNLOAD_SELECTED) {
-        send_progress(state, 5, "Connexion...");
-        JellyfinClient client;
-        JFResult r = sync_authenticate(cfg, state, client);
-        if (r == JF_ERR_AUTH) {
-            snprintf(state->error_msg, sizeof(state->error_msg),
-                     "Erreur d'authentification.");
-            return SYNC_ERR_AUTH;
-        }
-        if (r != JF_OK) {
-            snprintf(state->error_msg, sizeof(state->error_msg),
-                     "Impossible de joindre le serveur.");
-            return SYNC_ERR_NETWORK;
-        }
+    SendGlobalEvent(EVT_BOOKLIST_UPDATED, 0, 0);
+    if (state->dl_errors > 0)
+        snprintf(state->error_msg, sizeof(state->error_msg),
+                 stx(cfg, "%d téléchargement(s) en échec sur %d.", "%d of %d downloads failed."), state->dl_errors, total_dl);
+    snprintf(state->status_msg, sizeof(state->status_msg),
+             "%d livre(s) téléchargé(s)", state->downloaded);
+    log_write("Terminé : %d réussi(s), %d échec(s)\n", state->downloaded, state->dl_errors);
+    send_progress(state, 100, nullptr);
+    return state->dl_errors == total_dl ? SYNC_ERR_NETWORK : SYNC_OK;
+}
 
-        std::vector<int> to_dl;
-        for (int i = 0; i < (int)state->catalog.size(); ++i) {
-            auto& e = state->catalog[i];
-            if (e.status != BOOK_NEW && e.status != BOOK_UPDATED &&
-                e.status != BOOK_ERROR) continue;
-            if (mode == BG_DOWNLOAD_FOLDER) {
-                if (e.folder == state->download_folder_name) to_dl.push_back(i);
-            } else {
-                if (state->selected_ids.count(e.jf_id)) to_dl.push_back(i);
-            }
-        }
-
-        int total_dl = (int)to_dl.size();
-        state->downloaded = 0;
-        char msg[256];
-
-        if (total_dl == 0) {
-            snprintf(state->status_msg, sizeof(state->status_msg),
-                     "Rien à télécharger.");
-            return SYNC_OK;
-        }
-
-        for (int di = 0; di < total_dl; ++di) {
-            auto& entry = state->catalog[to_dl[di]];
-            int base_pct = 10 + (int)(85.0 * di / total_dl);
-            snprintf(msg, sizeof(msg), "(%d/%d) %s",
-                     di + 1, total_dl, entry.name.substr(0, 45).c_str());
-            send_progress(state, base_pct, msg);
-
-            std::string dest_dir2 = std::string(cfg->books_dir);
-            if (!entry.folder.empty()) {
-                dest_dir2 += "/" + entry.folder;
-                mkdir(dest_dir2.c_str(), 0755);
-            }
-            std::string dest = dest_dir2 + "/" + entry.filename;
-            entry.status = BOOK_DOWNLOADING;
-
-            JFBook book;
-            book.id        = entry.jf_id;
-            book.name      = entry.name;
-            book.path      = entry.remote_path;
-            book.file_size = entry.remote_size;
-
-            state->dl_book_name  = entry.name;
-            state->dl_bytes_now  = 0;
-            state->dl_bytes_total= entry.remote_size;
-            log_write("[DL %d/%d] Début : %s → %s (taille: %lld)\n",
-                      di + 1, total_dl, entry.name.c_str(),
-                      dest.c_str(), entry.remote_size);
-
-            r = jf_download_book(client, book, dest.c_str(),
-                [&](double done, double total) {
-                    double effective = (total > 0) ? total
-                                     : (book.file_size > 0 ? (double)book.file_size : 0);
-                    int pct = base_pct;
-                    if (effective > 0)
-                        pct = base_pct + (int)(85.0 / total_dl * done / effective);
-                    int book_pct = (effective > 0) ? (int)(done / effective * 100) : 50;
-                    state->dl_bytes_now  = (long long)done;
-                    state->dl_bytes_total= (long long)effective;
-                    if (book_pct != state->download_progress) {
-                        state->download_progress = book_pct;
-                        log_write("[DL %d/%d] %.0f / %.0f octets — global %d%%\n",
-                                  di + 1, total_dl, done, effective, pct);
-                        SendEvent(GetCurrentTask(), EVT_CUSTOM,
-                                  MSG_DOWNLOAD_PROGRESS, pct);
-                    }
-                });
-
-            if (r == JF_OK) {
-                entry.status = BOOK_SYNCED;
-                struct stat st;
-                if (stat(dest.c_str(), &st) == 0) entry.local_size = st.st_size;
-                state->downloaded++;
-                log_write("[DL %d/%d] OK — %lld octets sur disque\n",
-                          di + 1, total_dl, entry.local_size);
-            } else {
-                entry.status = BOOK_ERROR;
-                log_write("[DL %d/%d] ERREUR (code curl=%d)\n", di + 1, total_dl, (int)r);
-            }
-        }
-        state->dl_book_name.clear();
-
-        if (mode == BG_DOWNLOAD_SELECTED)
-            state->selected_ids.clear();
-
-        SendGlobalEvent(EVT_BOOKLIST_UPDATED, 0, 0);
-        snprintf(state->status_msg, sizeof(state->status_msg),
-                 "%d livre(s) téléchargé(s)", state->downloaded);
-        send_progress(state, 100, state->status_msg);
-        return SYNC_OK;
-    }
-
-    // ── Mode catalogue / sync complète ────────────────────────────────────────
-    wifi_keepalive();
+// ─── Chargement du catalogue ──────────────────────────────────────────────────
+static int load_catalog(AppConfig* cfg, AppState* state)
+{
     send_progress(state, 3, "Connexion au serveur...");
 
     JellyfinClient client;
     JFResult r = sync_authenticate(cfg, state, client);
-
     if (r == JF_ERR_AUTH) {
-        snprintf(state->error_msg, sizeof(state->error_msg),
-                 "Erreur d'authentification. Vérifiez identifiants / clé API.");
+        snprintf(state->error_msg, sizeof(state->error_msg), "%s",
+                 stx(cfg, "Identifiants refusés. Vérifiez les réglages.", "Credentials rejected. Check Settings."));
         return SYNC_ERR_AUTH;
     }
     if (r != JF_OK) {
         snprintf(state->error_msg, sizeof(state->error_msg),
-                 "Impossible de joindre %s", cfg->server_url);
+                 stx(cfg, "Impossible de joindre %s", "Cannot reach %s"), cfg->server_url);
         return SYNC_ERR_NETWORK;
     }
 
-    send_progress(state, 12, "Récupération des bibliothèques...");
+    send_progress(state, 15, "Recherche de la bibliothèque de livres...");
 
-    // ── Sélection bibliothèque ────────────────────────────────────────────────
     std::string lib_id = cfg->library_id;
-
     if (lib_id.empty()) {
         std::vector<JFLibrary> libs;
         r = jf_get_libraries(client, libs);
         if (r != JF_OK) {
-            snprintf(state->error_msg, sizeof(state->error_msg),
-                     "Impossible de lister les bibliothèques.");
+            snprintf(state->error_msg, sizeof(state->error_msg), "%s",
+                     stx(cfg, "Impossible de lister les bibliothèques.", "Cannot list the libraries."));
             return SYNC_ERR_NETWORK;
         }
+        for (auto& lib : libs)
+            log_write("Bibliothèque : %s (%s)\n", lib.name.c_str(), lib.collection_type.c_str());
 
         for (auto& lib : libs)
             if (lib.collection_type == "books") { lib_id = lib.id; break; }
@@ -408,44 +307,35 @@ static int sync_run(SyncContext* ctx)
         }
 
         if (lib_id.empty()) {
-            snprintf(state->error_msg, sizeof(state->error_msg),
-                     "Aucune bibliothèque 'Livres' trouvée.\n"
-                     "Configurez l'ID manuellement dans les paramètres.");
+            snprintf(state->error_msg, sizeof(state->error_msg), "%s",
+                     stx(cfg, "Aucune bibliothèque de livres trouvée sur le serveur.", "No book library found on the server."));
             return SYNC_ERR_NO_LIB;
         }
-
+        log_write("Bibliothèque retenue : %s\n", lib_id.c_str());
         strncpy(cfg->library_id, lib_id.c_str(), sizeof(cfg->library_id)-1);
         config_save(CONFIG_FILE, cfg);
     }
 
-    send_progress(state, 22, "Liste des livres...");
+    send_progress(state, 30, "Liste des livres...");
 
-    // ── Liste distante ────────────────────────────────────────────────────────
     std::vector<JFBook> remote_books;
     r = jf_get_books(client, lib_id, remote_books);
     if (r != JF_OK) {
         snprintf(state->error_msg, sizeof(state->error_msg),
-                 "Impossible de lister les livres (%d).", (int)r);
+                 stx(cfg, "Impossible de lister les livres (%d).", "Cannot list the books (%d)."), (int)r);
         return SYNC_ERR_NETWORK;
     }
-
     state->total_remote = (int)remote_books.size();
-    char msg[256];
-    snprintf(msg, sizeof(msg), "%d livre(s) sur le serveur", state->total_remote);
-    send_progress(state, 35, msg);
+    log_write("%d livre(s) sur le serveur\n", state->total_remote);
 
-    // ── Liste locale ──────────────────────────────────────────────────────────
+    send_progress(state, 70, "Comparaison avec la liseuse...");
     mkdir(cfg->books_dir, 0755);
     auto local_files = list_local_files(cfg->books_dir);
+    log_write("%d fichier(s) déjà dans %s\n", (int)local_files.size(), cfg->books_dir);
 
-    // ── Construction du catalogue ─────────────────────────────────────────────
     state->catalog.clear();
-    state->new_count   = 0;
-    state->downloaded  = 0;
-    state->skipped     = 0;
-    state->deleted     = 0;
-
-    std::set<std::string> expected;
+    state->new_count        = 0;
+    state->local_book_count = 0;
 
     for (auto& book : remote_books) {
         BookEntry entry;
@@ -454,12 +344,13 @@ static int sync_run(SyncContext* ctx)
         entry.remote_path = book.path;
         entry.remote_size = book.file_size;
         entry.folder      = extract_folder(book.path);
+        entry.filename    = sanitize_filename(book.name) + get_extension(book.path);
 
-        std::string ext  = get_extension(book.path);
-        entry.filename   = sanitize_filename(book.name) + ext;
-        expected.insert(entry.filename);
+        std::string rel = entry.folder.empty() ? entry.filename
+                                               : entry.folder + "/" + entry.filename;
+        auto it = local_files.find(rel);
+        if (it == local_files.end()) it = local_files.find(entry.filename);
 
-        auto it = local_files.find(entry.filename);
         if (it == local_files.end()) {
             entry.local_size = 0;
             entry.status     = BOOK_NEW;
@@ -469,30 +360,17 @@ static int sync_run(SyncContext* ctx)
             if (entry.remote_size > 0 && entry.local_size != entry.remote_size) {
                 entry.status = BOOK_UPDATED;
                 state->new_count++;
+                log_write("Mis à jour sur le serveur : %s (%lld → %lld octets)\n",
+                          rel.c_str(), entry.local_size, entry.remote_size);
             } else {
                 entry.status = BOOK_SYNCED;
+                state->local_book_count++;
             }
         }
-
         state->catalog.push_back(entry);
     }
 
-    // Livres locaux uniquement
-    for (auto& local : local_files) {
-        if (!expected.count(local.first)) {
-            BookEntry entry;
-            entry.jf_id      = "";
-            entry.name       = local.first;
-            entry.filename   = local.first;
-            entry.local_size = local.second;
-            entry.remote_size= 0;
-            entry.folder     = "";
-            entry.status     = BOOK_LOCAL_ONLY;
-            state->catalog.push_back(entry);
-        }
-    }
-
-    // Tri : par dossier, puis nouveaux en premier, puis alphabétique
+    // Tri : par dossier, nouveaux en premier, puis alphabétique
     std::sort(state->catalog.begin(), state->catalog.end(),
         [](const BookEntry& a, const BookEntry& b) {
             if (a.folder != b.folder) return a.folder < b.folder;
@@ -502,93 +380,44 @@ static int sync_run(SyncContext* ctx)
             return a.name < b.name;
         });
 
-    state->catalog_loaded = true;
-    state->selected_folder = "";
+    state->catalog_loaded    = true;
     state->download_book_idx = -1;
-
-    // Count locally present books
-    state->local_book_count = 0;
-    for (auto& e : state->catalog)
-        if (e.status == BOOK_SYNCED || e.status == BOOK_LOCAL_ONLY)
-            state->local_book_count++;
-
-    send_progress(state, 50, "Catalogue chargé");
-
-    // ── Mode catalogue uniquement ─────────────────────────────────────────────
-    if (mode == BG_CATALOG) {
-        snprintf(state->status_msg, sizeof(state->status_msg),
-                 "%d livre(s)  ·  %d nouveau(x)/mis à jour",
-                 state->total_remote, state->new_count);
-        return SYNC_OK;
-    }
-
-    // ── Téléchargement (mode BG_SYNC) ─────────────────────────────────────────
-    int total = (int)state->catalog.size();
-    int done  = 0;
-
-    for (auto& entry : state->catalog) {
-        if (entry.status != BOOK_NEW && entry.status != BOOK_UPDATED) {
-            done++;
-            continue;
-        }
-
-        int pct = 50 + (int)(45.0 * done / total);
-        snprintf(msg, sizeof(msg), "(%d/%d) %s",
-                 state->downloaded + 1, state->new_count,
-                 entry.name.substr(0, 45).c_str());
-        send_progress(state, pct, msg);
-
-        std::string dest_dir3 = std::string(cfg->books_dir);
-        if (!entry.folder.empty()) {
-            dest_dir3 += "/" + entry.folder;
-            mkdir(dest_dir3.c_str(), 0755);
-        }
-        std::string dest = dest_dir3 + "/" + entry.filename;
-        entry.status = BOOK_DOWNLOADING;
-
-        JFBook book;
-        book.id        = entry.jf_id;
-        book.name      = entry.name;
-        book.path      = entry.remote_path;
-        book.file_size = entry.remote_size;
-
-        r = jf_download_book(client, book, dest.c_str(), nullptr);
-
-        if (r == JF_OK) {
-            entry.status = BOOK_SYNCED;
-            struct stat st;
-            if (stat(dest.c_str(), &st) == 0) entry.local_size = st.st_size;
-            state->downloaded++;
-        } else {
-            entry.status = BOOK_ERROR;
-        }
-        done++;
-    }
-
-    // ── Suppression optionnelle ───────────────────────────────────────────────
-    if (cfg->delete_local) {
-        for (auto& entry : state->catalog) {
-            if (entry.status == BOOK_LOCAL_ONLY) {
-                std::string path = std::string(cfg->books_dir) + "/" + entry.filename;
-                remove(path.c_str());
-                state->deleted++;
-            }
-        }
-        state->catalog.erase(
-            std::remove_if(state->catalog.begin(), state->catalog.end(),
-                [](const BookEntry& e){ return e.status == BOOK_LOCAL_ONLY; }),
-            state->catalog.end());
-    }
-
-    SendGlobalEvent(EVT_BOOKLIST_UPDATED, 0, 0);
+    state->selected_ids.clear();
 
     snprintf(state->status_msg, sizeof(state->status_msg),
-             "Sync terminée : %d téléchargé(s), %d déjà présent(s)%s",
-             state->downloaded, state->skipped,
-             cfg->delete_local ?
-                 (std::string(", ") + std::to_string(state->deleted) + " supprimé(s)").c_str()
-                 : "");
-
-    send_progress(state, 100, state->status_msg);
+             "%d livre(s), %d nouveau(x) ou mis à jour",
+             state->total_remote, state->new_count);
+    log_write("Catalogue prêt : %d nouveau(x), %d sur la liseuse\n",
+              state->new_count, state->local_book_count);
+    send_progress(state, 100, nullptr);
     return SYNC_OK;
+}
+
+// ─── Point d'entrée du thread de fond ─────────────────────────────────────────
+static int sync_run(SyncContext* ctx)
+{
+    AppConfig* cfg   = ctx->config;
+    AppState*  state = ctx->state;
+
+    // Disable WiFi power management before any network activity.
+    wifi_keepalive();
+
+    if (ctx->mode == BG_CATALOG)
+        return load_catalog(cfg, state);
+
+    std::vector<int> to_dl;
+    for (int i = 0; i < (int)state->catalog.size(); ++i) {
+        auto& e = state->catalog[i];
+        bool wanted = false;
+        if (ctx->mode == BG_DOWNLOAD_ONE)
+            wanted = (i == state->download_book_idx);
+        else if (e.status != BOOK_NEW && e.status != BOOK_UPDATED && e.status != BOOK_ERROR)
+            wanted = false;
+        else if (ctx->mode == BG_DOWNLOAD_FOLDER)
+            wanted = (e.folder == state->download_folder_name);
+        else
+            wanted = state->selected_ids.count(e.jf_id) > 0;
+        if (wanted) to_dl.push_back(i);
+    }
+    return download_entries(cfg, state, to_dl);
 }
