@@ -100,6 +100,59 @@ ssh -p 2222 root@192.168.1.44 "killall jellysync.app; /mnt/ext1/applications/jel
 
 ---
 
+## Tester sur PC (émulateur)
+
+Le dossier `emulator/` permet de lancer JellySync dans une fenêtre sur PC, sans liseuse.
+Il remplace InkView (la bibliothèque graphique PocketBook) par une version SDL2 qui
+simule l'écran de l'InkPad 3 (1404×1872, 16 niveaux de gris). Le code de `src/` est
+compilé tel quel ; le build liseuse n'est pas modifié.
+
+### Installation des dépendances (une seule fois)
+
+**Mac** (avec [Homebrew](https://brew.sh)) :
+```bash
+brew install cmake pkg-config sdl2 sdl2_ttf
+```
+
+**Windows** : dans Ubuntu sous WSL2 (les fenêtres Linux s'affichent directement sous
+Windows 11 et Windows 10 à jour ; si besoin, `wsl --update` dans PowerShell) :
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake pkg-config libsdl2-dev libsdl2-ttf-dev libcurl4-openssl-dev python3
+```
+
+### Lancer
+
+Depuis la racine du projet :
+```bash
+./emulator/run.sh          # avec votre vrai serveur Jellyfin
+./emulator/run.sh --mock   # avec un faux serveur Jellyfin de démonstration
+```
+
+Avec `--mock`, saisissez `http://127.0.0.1:8096` comme serveur et n'importe quel
+utilisateur / mot de passe (le mot de passe `bad` simule une erreur d'authentification).
+
+### Commandes
+
+| Liseuse | Émulateur |
+|---|---|
+| Toucher l'écran | Clic gauche |
+| Bouton Retour | Échap ou Retour arrière |
+| Page précédente / suivante | ← / → , Page ↑ / Page ↓ , molette |
+| Clavier virtuel | Boîte de saisie : Entrée valide, Échap annule, Ctrl/Cmd+V colle |
+| — | F5 : redessiner l'écran · F12 : capture `jellysync-screenshot.bmp` |
+
+La mémoire de la liseuse (`/mnt/ext1`) est simulée par `build-emu/ext1/` : la
+configuration est dans `build-emu/ext1/system/config/jellysync.cfg` et les livres
+téléchargés dans `build-emu/ext1/books/Jellyfin/`.
+
+Options (variables d'environnement) :
+- `JELLYSYNC_SCALE=0.5` : taille de la fenêtre (ajustée à l'écran par défaut)
+- `JELLYSYNC_SCREEN=1072x1448` : simuler une autre résolution de liseuse
+- `JELLYSYNC_SHOT=ecran.bmp` : enregistrer l'écran après chaque rafraîchissement
+
+---
+
 ## Compilation via GitHub Actions (sans WSL2)
 
 Poussez le code sur GitHub, la compilation se déclenche automatiquement.
@@ -125,6 +178,7 @@ Le fichier `/mnt/ext1/jellysync.log` sera lisible via USB.
 ```
 JellySync/
 ├── CMakeLists.txt
+├── emulator/             # Build PC : InkView simulé (SDL2), faux Jellyfin
 ├── .github/workflows/build.yml
 └── src/
     ├── main.cpp          # Point d'entrée + boucle événements
