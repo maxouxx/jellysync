@@ -26,6 +26,7 @@ struct JFBook {
     std::string name;
     std::string path;
     long long   file_size;
+    std::string image_tag;      // ImageTags.Primary : la couverture, si elle existe
 };
 
 enum JFResult {
@@ -66,6 +67,12 @@ JFResult jf_download_book(const JellyfinClient& client,
                             const JFBook& book,
                             const char* dest_path,
                             std::function<void(double,double)> progress_cb);
+
+JFResult jf_download_cover(const JellyfinClient& client,
+                            const std::string& item_id,
+                            const std::string& tag,
+                            int max_w, int max_h,
+                            const char* dest_path);
 
 // ─── Implémentation (incluse une seule fois depuis main.cpp) ──────────────────
 #ifdef JELLYFIN_API_IMPL
@@ -295,7 +302,8 @@ JFResult jf_get_books(const JellyfinClient& c,
         char ep[512];
         snprintf(ep, sizeof(ep),
             "/Items?parentId=%s&includeItemTypes=Book&recursive=true"
-            "&fields=Path,MediaSources,Size&limit=%d&startIndex=%d",
+            "&fields=Path,MediaSources,Size&enableImageTypes=Primary&imageTypeLimit=1"
+            "&limit=%d&startIndex=%d",
             lib_id.c_str(), PAGE, start);
 
         MemBuffer buf;
@@ -322,6 +330,9 @@ JFResult jf_get_books(const JellyfinClient& c,
                 cJSON* sz = cJSON_GetObjectItem(cJSON_GetArrayItem(ms, 0), "Size");
                 if (sz) book.file_size = (long long)cJSON_GetNumberValue(sz);
             }
+            cJSON* tags = cJSON_GetObjectItem(item, "ImageTags");
+            cJSON* prim = tags ? cJSON_GetObjectItem(tags, "Primary") : nullptr;
+            if (prim && cJSON_IsString(prim)) book.image_tag = cJSON_GetStringValue(prim);
             out.push_back(book);
             count++;
         }
@@ -442,6 +453,34 @@ JFResult jf_download_book(const JellyfinClient& c, const JFBook& book,
     }
     log_write("  abandon après %d tentatives sans progrès\n", MAX_FAILS);
     return JF_ERR_NETWORK;
+}
+
+// Couverture (image « Primary ») en PNG, réduite par le serveur à la taille
+// affichée. Pas de reconnexion Wi-Fi ici : une vignette manquante n'est pas
+// grave, on réessaiera au prochain affichage.
+JFResult jf_download_cover(const JellyfinClient& c, const std::string& id,
+                            const std::string& tag, int max_w, int max_h,
+                            const char* dest)
+{
+    char ep[512];
+    snprintf(ep, sizeof(ep), "/Items/%s/Images/Primary?tag=%s&maxWidth=%d&maxHeight=%d"
+             "&format=Png", id.c_str(), tag.c_str(), max_w, max_h);
+    MemBuffer buf;
+    long code = 0;
+    JFResult r = _do_get_once(c, ep, buf, &code);
+    if (r != JF_OK) return r;
+    // Signature PNG : 89 50 4E 47
+    if (buf.data.size() < 8 || buf.data.compare(0, 4, "\x89PNG") != 0) {
+        log_write("  couverture ignorée : ce n'est pas un PNG\n");
+        return JF_ERR_JSON;
+    }
+    std::string tmp = std::string(dest) + ".part";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return JF_ERR_IO;
+    bool ok = fwrite(buf.data.data(), 1, buf.data.size(), f) == buf.data.size();
+    ok = (fclose(f) == 0) && ok;
+    if (!ok || rename(tmp.c_str(), dest) != 0) { remove(tmp.c_str()); return JF_ERR_IO; }
+    return JF_OK;
 }
 
 #endif // JELLYFIN_API_IMPL

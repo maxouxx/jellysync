@@ -11,6 +11,8 @@
  *   • Rafraîchissement complet seulement quand l'écran change ; sinon partiel,
  *     limité à la zone modifiée.
  *   • Pendant un téléchargement, les 20 % du bas affichent le journal détaillé.
+ *   • Option « Affichage Vignette » : la liste des livres montre la couverture
+ *     de chaque livre, avec des lignes plus hautes.
  */
 
 #include <inkview.h>
@@ -26,6 +28,7 @@
 #include <cstdlib>
 #include <ctime>
 #include "config.h"
+#include "covers.h"
 
 extern void log_write(const char* fmt, ...);
 // Dernières lignes du journal (définie dans main.cpp) ; renvoie le compteur
@@ -50,7 +53,10 @@ static inline int U(int px) { return px * SW / 1404; }
 #define GAP       U(24)
 #define BANNER_H  U(132)
 #define TABS_H    U(100)
-#define ROW_H     U(156)
+#define ROW_H     row_h()  // U(156), ou ROW_H_COVER avec les vignettes
+#define ROW_H_COVER U(232)
+#define COVER_W   U(134)   // vignette 2:3 (format d'une couverture)
+#define COVER_H   U(200)
 #define FOOT_H    U(136)
 #define LINE      std::max(2, U(4))   // trait épais (bordures)
 #define HAIR      std::max(1, U(2))   // filet
@@ -96,6 +102,7 @@ struct TouchZone { int x, y, w, h, id; };
 #define ZONE_LANG_FR          37
 #define ZONE_LANG_EN          38
 #define ZONE_AUTH_KEY         39
+#define ZONE_COVERS           40
 #define ZONE_FOLDER_BASE    1000   // + index dans g_folders
 #define ZONE_ROW_SELECT     2000   // + ligne visible
 #define ZONE_ROW_DL         3000   // + ligne visible
@@ -137,6 +144,15 @@ static int g_list_total = 0;                     // éléments de la liste coura
 struct Rect { int x, y, w, h; };
 static Rect g_progress_rect = { 0, 0, 0, 0 };
 static Rect g_log_rect      = { 0, 0, 0, 0 };
+
+// Lignes plus hautes dans la liste des livres quand les vignettes sont affichées
+static bool covers_shown()
+{
+    return g_ui_cfg && g_ui_state && g_ui_cfg->show_covers &&
+           g_ui_state->screen == SCREEN_MAIN && g_ui_state->in_folder;
+}
+
+static int row_h() { return covers_shown() ? ROW_H_COVER : U(156); }
 
 static const char* tr(const char* fr, const char* en)
 {
@@ -673,6 +689,8 @@ static void draw_screen_books(AppConfig* cfg, AppState* state)
 
     int top = list_top(), w = sw - 2 * mg;
     int chk = U(76);
+    bool covers = covers_shown();
+    if (covers) covers_new_page();
     if (rows.empty())
         draw_empty(tr("Aucun livre dans cette catégorie.", "No book in this category."));
 
@@ -695,6 +713,21 @@ static void draw_screen_books(AppConfig* cfg, AppState* state)
 
         int dl_x = mg + w - BTN_H;
         int tx = mg + chk + U(32), tw = dl_x - GAP - tx;
+
+        // Vignette : la couverture, ou un cadre avec le format en attendant
+        if (covers) {
+            int vx = tx, vy = cy - COVER_H / 2;
+            ibitmap* bmp = cover_get(b, COVER_W, COVER_H);
+            if (bmp) {
+                DrawBitmap(vx + (COVER_W - bmp->width) / 2, vy + (COVER_H - bmp->height) / 2, bmp);
+            } else {
+                frame(vx, vy, COVER_W, COVER_H, HAIR, C_GRAY_MID);
+                std::string ext = fmt_ext(b.filename);
+                text_line(vx, cy, COVER_W, ext.c_str(), F_PILL, true, C_GRAY_MID, ALIGN_CENTER);
+            }
+            tx += COVER_W + U(28);
+            tw = dl_x - GAP - tx;
+        }
 
         bool strong = sel_ok || b.status == BOOK_DOWNLOADING;
         text_line(tx, ry + ROW_H * 36 / 100, tw, b.name.c_str(), F_ROW, strong,
@@ -887,6 +920,26 @@ static int draw_segmented(int y, const char* a, const char* b, int active, int z
     return y + h + U(20);
 }
 
+// Ligne de réglage avec un interrupteur ON/OFF à droite ; toute la ligne est tactile
+static int draw_toggle(int y, const char* label, const char* detail, bool on, int zone)
+{
+    int sw = SW, mg = MG, w = sw - 2 * mg, h = U(140);
+    int tw = U(240), th = BTN_H, tx = mg + w - tw, ty = y + (h - th) / 2;
+
+    text_line(mg, y + h * 34 / 100, tx - mg - GAP, label, F_ROW, true, C_BLACK);
+    text_line(mg, y + h * 72 / 100, tx - mg - GAP, detail, F_DETAIL, false, C_GRAY_DARK);
+
+    for (int i = 0; i < 2; ++i) {
+        bool active = (i == 1) == on;   // moitié gauche OFF, moitié droite ON
+        int x = tx + i * tw / 2, cw = i ? tw - tw / 2 : tw / 2;
+        FillArea(x, ty, cw, th, active ? C_BLACK : C_WHITE);
+        text_line(x, ty + th / 2, cw, i ? "ON" : "OFF", F_BTN, active, active ? C_WHITE : C_GRAY_MID, ALIGN_CENTER);
+    }
+    frame(tx, ty, tw, th, LINE, C_BLACK);
+    zones_add(mg, y, w, h, zone);
+    return y + h + U(20);
+}
+
 static void draw_screen_setup(AppConfig* cfg, AppState* state)
 {
     int sw = SW, sh = SH, mg = MG;
@@ -912,6 +965,11 @@ static void draw_screen_setup(AppConfig* cfg, AppState* state)
 
     y = draw_section(y + U(10), tr("LANGUE", "LANGUAGE"));
     y = draw_segmented(y, "Français", "English", cfg->lang == 1 ? 1 : 0, ZONE_LANG_FR, ZONE_LANG_EN);
+
+    y = draw_section(y + U(10), tr("AFFICHAGE", "DISPLAY"));
+    y = draw_toggle(y, tr("Affichage Vignette", "Show thumbnails"),
+                    tr("Couverture des livres dans la liste", "Book covers in the list"),
+                    cfg->show_covers != 0, ZONE_COVERS);
 
     int bh = U(124), bw = (sw - 2 * mg - GAP) / 2, by = sh - mg - bh;
     button(mg, by, bw, bh, tr("Annuler", "Cancel"), BTN_OUTLINE);
@@ -1161,7 +1219,12 @@ static void ui_handle_tap(int px, int py,
             if (cfg->lang != l) { cfg->lang = l; ui_draw(cfg, state); }
             break;
         }
+        case ZONE_COVERS:
+            cfg->show_covers = cfg->show_covers ? 0 : 1;
+            ui_draw_region(cfg, state, HDR_H, SH);
+            break;
         case ZONE_SAVE: {
+            if (!cfg->show_covers) covers_free_bitmaps();
             bool server_changed = strcmp(cfg->server_url, g_cfg_backup.server_url) != 0;
             if (server_changed) cfg->library_id[0] = 0;
             config_save(CONFIG_FILE, cfg);

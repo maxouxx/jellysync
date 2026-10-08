@@ -352,6 +352,7 @@ static int load_catalog(AppConfig* cfg, AppState* state)
         entry.name        = book.name;
         entry.remote_path = book.path;
         entry.remote_size = book.file_size;
+        entry.cover_tag   = book.image_tag;
         entry.folder      = extract_folder(book.path);
         entry.filename    = sanitize_filename(book.name) + get_extension(book.path);
 

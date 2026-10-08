@@ -24,6 +24,7 @@ file(MAKE_DIRECTORY "${EMU_FLASHDIR}/system/config" "${EMU_FLASHDIR}/books/Jelly
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2 SDL2_ttf)
 find_package(CURL REQUIRED)
+find_package(PNG REQUIRED)
 find_package(Threads REQUIRED)
 
 add_executable(jellysync-emu
@@ -52,4 +53,4 @@ target_compile_options(jellysync-emu PRIVATE
     -Wall -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function)
 
 target_link_libraries(jellysync-emu PRIVATE
-    PkgConfig::SDL2 CURL::libcurl Threads::Threads)
+    PkgConfig::SDL2 CURL::libcurl PNG::PNG Threads::Threads)

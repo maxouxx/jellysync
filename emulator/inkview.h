@@ -85,6 +85,15 @@ typedef struct ifont_s {
     void* fallback;    // TTF_Font* (DejaVu Sans, pour ✓ ↓ ─ absents de Liberation)
 } ifont;
 
+// Image en niveaux de gris (depth 8), allouée d'un bloc : libérée par free()
+typedef struct ibitmap_s {
+    unsigned short width;
+    unsigned short height;
+    unsigned short depth;
+    unsigned short scanline;
+    unsigned char  data[];
+} ibitmap;
+
 typedef int  (*iv_handler)(int type, int par1, int par2);
 typedef void (*iv_keyboardhandler)(char* text);
 typedef void (*iv_timerproc)(void);
@@ -116,6 +125,10 @@ void SendEventTo(int task, int type, int par1, int par2);
 
 void OpenKeyboard(const char* title, char* buffer, int maxlen, int flags,
                   iv_keyboardhandler hproc);
+
+// PNG réduit pour tenir dans width×height (proportional = garder le format)
+ibitmap* LoadPNGStretch(const char* path, int width, int height, int proportional, int dither);
+void     DrawBitmap(int x, int y, const ibitmap* b);
 
 // Barre d'état : tant qu'elle est active, l'affichage est décalé de sa hauteur
 // vers le bas (le bas de l'image réapparaît en haut), comme sur la liseuse.

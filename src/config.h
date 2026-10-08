@@ -15,6 +15,7 @@
 #define MSG_DOWNLOAD_PROGRESS   0x06
 #define MSG_DOWNLOAD_DONE       0x07
 #define MSG_DOWNLOAD_ERROR      0x08
+#define MSG_COVER_READY         0x09
 
 // ─── Écrans ───────────────────────────────────────────────────────────────────
 enum Screen {
@@ -47,6 +48,7 @@ struct BookEntry {
     std::string filename;
     std::string remote_path;
     std::string folder;         // Dossier parent (extrait du chemin serveur)
+    std::string cover_tag;      // ImageTags.Primary ("" = pas de couverture)
     long long   remote_size;
     long long   local_size;
     BookStatus  status;
@@ -62,6 +64,7 @@ struct AppConfig {
     int  auth_mode;       // 0 = identifiants, 1 = clé API
     char books_dir[512];
     int  lang;            // 0 = Français, 1 = English
+    int  show_covers;     // Affichage Vignette : 1 = couvertures dans la liste
 };
 
 // ─── État applicatif (non persisté) ──────────────────────────────────────────
@@ -143,6 +146,7 @@ static void config_load(const char* path, AppConfig* cfg)
         else if (strcmp(key, "auth_mode")   == 0) { cfg->auth_mode = atoi(val); has_auth_mode = true; }
         else if (strcmp(key, "books_dir")   == 0) strncpy(cfg->books_dir,   val, 511);
         else if (strcmp(key, "lang")        == 0) cfg->lang = atoi(val);
+        else if (strcmp(key, "show_covers") == 0) cfg->show_covers = atoi(val) ? 1 : 0;
     }
     fclose(f);
     // Anciennes configs : la clé API, si présente, était prioritaire
@@ -161,5 +165,6 @@ static void config_save(const char* path, const AppConfig* cfg)
     fprintf(f, "auth_mode=%d\n",    cfg->auth_mode);
     fprintf(f, "books_dir=%s\n",    cfg->books_dir);
     fprintf(f, "lang=%d\n",         cfg->lang);
+    fprintf(f, "show_covers=%d\n",  cfg->show_covers);
     fclose(f);
 }
