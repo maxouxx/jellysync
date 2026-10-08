@@ -8,10 +8,14 @@ Dans l'app : URL = http://127.0.0.1:8096, utilisateur/mot de passe quelconques
 (ou n'importe quelle clé API). Le mot de passe "bad" simule une erreur d'authentification.
 Un catalogue d'environ 60 livres répartis en dossiers est servi ; chaque
 téléchargement renvoie un petit fichier factice, envoyé lentement pour voir
-la barre de progression.
+la barre de progression. Les requêtes Range (reprise) sont acceptées.
+
+Wi-Fi simulé : tant que /tmp/jellysync-emu-wifi-off existe (touche F9 dans
+l'émulateur), le serveur ne répond plus et coupe les transferts en cours.
 """
 
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,6 +54,12 @@ for folder, titles in AUTHORS.items():
             "MediaSources": [{"Size": size}], "Size": size,
         })
 BY_ID = {b["Id"]: b for b in BOOKS}
+WIFI_OFF_FLAG = "/tmp/jellysync-emu-wifi-off"
+DELAY = float(os.environ.get("MOCK_DELAY", "0.01"))  # pause entre deux blocs de 4 Ko
+
+
+def wifi_off():
+    return os.path.exists(WIFI_OFF_FLAG)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -61,7 +71,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _drop(self):
+        # Liaison coupée : on ferme sans répondre
+        self.close_connection = True
+        try:
+            self.connection.shutdown(2)
+        except OSError:
+            pass
+
     def do_POST(self):
+        if wifi_off():
+            return self._drop()
         url = urlparse(self.path)
         body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
         if url.path == "/Users/AuthenticateByName":
@@ -76,6 +96,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found"}, 404)
 
     def do_GET(self):
+        if wifi_off():
+            return self._drop()
         url = urlparse(self.path)
         q = parse_qs(url.query)
         p = url.path
@@ -96,17 +118,32 @@ class Handler(BaseHTTPRequestHandler):
             if not book:
                 return self._json({"error": "not found"}, 404)
             size = book["Size"]
-            self.send_response(200)
+            start = 0
+            rng = self.headers.get("Range", "")
+            if rng.startswith("bytes="):
+                start = int(rng[6:].split("-")[0] or 0)
+                if start >= size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.end_headers()
+                    return
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{size - 1}/{size}")
+            else:
+                self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(size - start))
             self.end_headers()
             chunk = b"x" * 4096
-            sent = 0
+            sent = start
             while sent < size:
+                if wifi_off():
+                    return self._drop()
                 n = min(len(chunk), size - sent)
                 self.wfile.write(chunk[:n])
                 sent += n
-                time.sleep(0.01)
+                time.sleep(DELAY)
             return
         self._json({"error": "not found"}, 404)
 

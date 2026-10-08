@@ -140,7 +140,7 @@ utilisateur / mot de passe (le mot de passe `bad` simule une erreur d'authentifi
 | Bouton Retour | Échap ou Retour arrière |
 | Page précédente / suivante | ← / → , Page ↑ / Page ↓ , molette |
 | Clavier virtuel | Boîte de saisie : Entrée valide, Échap annule, Ctrl/Cmd+V colle |
-| — | F5 : redessiner l'écran · F12 : capture `jellysync-screenshot.bmp` |
+| — | F5 : redessiner l'écran · F12 : capture `jellysync-screenshot.bmp` · F9 : couper / rétablir le Wi-Fi simulé |
 
 La mémoire de la liseuse (`/mnt/ext1`) est simulée par `build-emu/ext1/` : la
 configuration est dans `build-emu/ext1/system/config/jellysync.cfg` et les livres

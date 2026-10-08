@@ -112,6 +112,7 @@ struct AppState {
     // Statuts connexion (mis à jour après Refresh)
     bool        wifi_connected;
     bool        server_connected;
+    bool        wifi_reconnecting;  // reconnexion Wi-Fi en cours
     int         local_book_count;
 };
 

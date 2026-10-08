@@ -8,6 +8,9 @@
 #include <vector>
 #include <functional>
 #include <curl/curl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cstdio>
 #include "cJSON.h"
 
 // ─── Structures ───────────────────────────────────────────────────────────────
@@ -101,25 +104,35 @@ static std::string _auth_header(const JellyfinClient& c)
     return h;
 }
 
-// Disable WiFi power management to prevent disconnects during transfers.
+// ─── Wi-Fi ────────────────────────────────────────────────────────────────────
+// Vérifie que le Wi-Fi est connecté et le reconnecte sinon. Fourni par
+// main.cpp (InkView) ; peut être appelé depuis le thread de fond.
+extern bool net_ensure(const char* why);
+
+// Désactive l'économie d'énergie de la puce Wi-Fi, qui coupe la liaison
+// pendant les longs transferts.
 static void wifi_keepalive()
 {
-    system("iwconfig wlan0 power off 2>/dev/null");
+    system("iwconfig wlan0 power off >/dev/null 2>&1");
 }
 
-// Apply TCP keepalive settings to a curl handle so long-idle connections
-// don't get dropped by the router/NAT.
+// Keepalive TCP + délais : une liaison morte (Wi-Fi coupé) est détectée en
+// 45 s au lieu d'attendre la fin du délai global.
 static void _curl_set_keepalive(CURL* curl)
 {
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE,  1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE,   30L);  // first probe after 30s idle
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL,  10L);  // probe every 10s thereafter
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE,   1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE,    30L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL,   10L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,  15L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  45L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,        1L);
 }
 
 extern void log_write(const char* fmt, ...);
 
-static JFResult _do_get(const JellyfinClient& c, const std::string& ep,
-                         MemBuffer& buf, long* code_out = nullptr)
+static JFResult _do_get_once(const JellyfinClient& c, const std::string& ep,
+                              MemBuffer& buf, long* code_out)
 {
     CURL* curl = curl_easy_init();
     if (!curl) return JF_ERR_NETWORK;
@@ -152,6 +165,20 @@ static JFResult _do_get(const JellyfinClient& c, const std::string& ep,
     if (code == 401)     return JF_ERR_AUTH;
     if (code >= 400)     return JF_ERR_HTTP;
     return JF_OK;
+}
+
+// GET avec une nouvelle tentative après reconnexion du Wi-Fi
+static JFResult _do_get(const JellyfinClient& c, const std::string& ep,
+                         MemBuffer& buf, long* code_out = nullptr)
+{
+    JFResult r = _do_get_once(c, ep, buf, code_out);
+    if (r == JF_ERR_NETWORK) {
+        net_ensure("requête au serveur");
+        sleep(2);
+        buf.data.clear();
+        r = _do_get_once(c, ep, buf, code_out);
+    }
+    return r;
 }
 
 JFResult jf_authenticate(JellyfinClient& client,
@@ -187,8 +214,9 @@ JFResult jf_authenticate(JellyfinClient& client,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS,     body_str);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  _write_mem);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &buf);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT,        15L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT,        30L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    _curl_set_keepalive(curl);
 
     log_write("POST /Users/AuthenticateByName (utilisateur « %s »)\n", user);
     CURLcode res = curl_easy_perform(curl);
@@ -305,19 +333,29 @@ JFResult jf_get_books(const JellyfinClient& c,
     return JF_OK;
 }
 
-// Single download attempt — returns CURLE_OK / curl error code via res_out.
+// Une tentative de téléchargement vers dest + ".part". Si un fichier partiel
+// existe déjà (tentative précédente coupée par le Wi-Fi), on reprend là où il
+// s'est arrêté grâce à une requête Range.
 static JFResult _download_once(const JellyfinClient& c, const JFBook& book,
-                                const char* dest,
-                                std::function<void(double,double)> prog)
+                                const std::string& part,
+                                std::function<void(double,double)> prog,
+                                long long* got)
 {
-    FILE* f = fopen(dest, "wb");
+    long long have = 0;
+    struct stat st;
+    if (stat(part.c_str(), &st) == 0) have = st.st_size;
+
+    FILE* f = fopen(part.c_str(), have > 0 ? "ab" : "wb");
     if (!f) return JF_ERR_IO;
     CURL* curl = curl_easy_init();
     if (!curl) { fclose(f); return JF_ERR_NETWORK; }
     std::string url = c.base_url + "/Items/" + book.id + "/Download";
     curl_slist* hdrs = nullptr;
     hdrs = curl_slist_append(hdrs, _auth_header(c).c_str());
-    _ProgressData pd{ prog };
+    // La progression affichée compte aussi ce qui était déjà reçu
+    _ProgressData pd{ [&](double now, double total) {
+        if (prog) prog(now + have, total > 0 ? total + have : 0);
+    } };
     curl_easy_setopt(curl, CURLOPT_URL,              url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER,       hdrs);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,    _write_file);
@@ -325,11 +363,16 @@ static JFResult _download_once(const JellyfinClient& c, const JFBook& book,
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, _progress_cb);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA,     &pd);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS,       0L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT,          600L);  // 10 min for large books
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,   1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER,   0L);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR,      1L);
+    if (have > 0) {
+        curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)have);
+        log_write("GET /Items/%s/Download (reprise à %lld octets)\n", book.id.c_str(), have);
+    } else {
+        log_write("GET /Items/%s/Download\n", book.id.c_str());
+    }
     _curl_set_keepalive(curl);
-    log_write("GET /Items/%s/Download\n", book.id.c_str());
     CURLcode res = curl_easy_perform(curl);
     long code = 0;
     double secs = 0, speed = 0;
@@ -339,16 +382,26 @@ static JFResult _download_once(const JellyfinClient& c, const JFBook& book,
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);
     fclose(f);
-    if (res != CURLE_OK) {
-        log_write("  erreur réseau : %s\n", curl_easy_strerror(res));
-        remove(dest); return JF_ERR_NETWORK;
+    if (stat(part.c_str(), &st) == 0) *got = st.st_size;
+
+    if (res == CURLE_RANGE_ERROR || code == 416) {
+        // Le serveur refuse la reprise : on repartira de zéro
+        log_write("  reprise refusée par le serveur, on recommence au début\n");
+        remove(part.c_str());
+        *got = 0;
+        return JF_ERR_NETWORK;
     }
-    if (code >= 400) {
+    if (res == CURLE_HTTP_RETURNED_ERROR) {
         log_write("  refusé par le serveur : HTTP %ld\n", code);
-        remove(dest); return JF_ERR_NETWORK;
+        remove(part.c_str());
+        return code == 401 ? JF_ERR_AUTH : JF_ERR_HTTP;
+    }
+    if (res != CURLE_OK) {
+        // Fichier partiel conservé pour reprendre à la prochaine tentative
+        log_write("  erreur réseau : %s (%lld octets reçus)\n", curl_easy_strerror(res), *got);
+        return JF_ERR_NETWORK;
     }
     log_write("  HTTP %ld en %.1f s (%.0f Ko/s)\n", code, secs, speed / 1024.0);
-    log_write("  écrit : %s\n", dest);
     return JF_OK;
 }
 
@@ -356,23 +409,38 @@ JFResult jf_download_book(const JellyfinClient& c, const JFBook& book,
                             const char* dest,
                             std::function<void(double,double)> prog)
 {
-    // Re-disable WiFi power saving before every download attempt.
+    std::string part = std::string(dest) + ".part";
     wifi_keepalive();
 
-    const int MAX_RETRIES = 3;
-    for (int attempt = 1; attempt <= MAX_RETRIES; ++attempt) {
-        JFResult r = _download_once(c, book, dest, prog);
-        if (r == JF_OK) return JF_OK;
-
-        if (attempt < MAX_RETRIES) {
-            log_write("  tentative %d/%d échouée, nouvel essai dans 3 s\n",
-                      attempt, MAX_RETRIES);
-            // Wait, then wake WiFi back up before retrying.
-            sleep(3);
-            wifi_keepalive();
+    // Une coupure Wi-Fi ne fait pas échouer le livre : on reconnecte puis on
+    // reprend. On n'abandonne qu'après plusieurs tentatives sans progrès.
+    const int MAX_FAILS = 4;
+    int fails = 0;
+    long long last_got = -1;
+    while (true) {
+        long long got = 0;
+        JFResult r = _download_once(c, book, part, prog, &got);
+        if (r == JF_OK) {
+            remove(dest);
+            if (rename(part.c_str(), dest) != 0) {
+                log_write("  impossible de renommer %s\n", part.c_str());
+                return JF_ERR_IO;
+            }
+            log_write("  écrit : %s\n", dest);
+            return JF_OK;
         }
+        if (r != JF_ERR_NETWORK) return r;
+
+        if (got > last_got) fails = 0;   // ça avançait : la tentative ne compte pas
+        last_got = got;
+        if (++fails >= MAX_FAILS) break;
+
+        log_write("  tentative échouée (%d/%d), vérification du Wi-Fi\n", fails, MAX_FAILS);
+        sleep(2);
+        if (!net_ensure("reprise du téléchargement")) sleep(5);
+        wifi_keepalive();
     }
-    log_write("  abandon après %d tentatives\n", MAX_RETRIES);
+    log_write("  abandon après %d tentatives sans progrès\n", MAX_FAILS);
     return JF_ERR_NETWORK;
 }
 

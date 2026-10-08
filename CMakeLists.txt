@@ -48,14 +48,14 @@ add_compile_definitions(
     USERDATA="/mnt/ext1/system"
     CONFIG_FILE="/mnt/ext1/system/config/jellysync.cfg"
     BOOKS_DIR="/mnt/ext1/books/Jellyfin"
-    APP_VERSION="1.0.0"
+    APP_VERSION="1.0.1"
     JELLYFIN_API_IMPL
 )
 
 add_executable(jellysync.app src/main.cpp src/cJSON.cpp)
 
 target_link_libraries(jellysync.app
-    inkview pthread curl ssl crypto z m stdc++
+    inkview pthread curl ssl crypto z m dl stdc++
 )
 
 add_custom_command(TARGET jellysync.app POST_BUILD

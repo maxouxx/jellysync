@@ -12,6 +12,8 @@
  *   JELLYSYNC_SCREEN=1404x1872   résolution simulée
  *   JELLYSYNC_SCALE=0.45         zoom de la fenêtre (auto par défaut)
  *   JELLYSYNC_SHOT=fichier.bmp   enregistre l'écran après chaque rafraîchissement
+ *   JELLYSYNC_WIFI=off           démarre avec le Wi-Fi coupé (F9 bascule)
+ *   JELLYSYNC_PANEL_H=136        hauteur de la barre d'état simulée
  */
 
 #include "inkview.h"
@@ -27,6 +29,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -68,6 +71,19 @@ Uint32                  g_wake_event = 0;
 
 KeyboardOverlay g_kb;
 const char*     g_shot_path = nullptr;
+
+// Barre d'état du système : active par défaut, comme sur la liseuse
+int             g_panel_type = PANEL_ENABLED;
+int             g_panel_h    = 136;
+
+// Wi-Fi simulé. Le faux serveur (mock_jellyfin.py) coupe ses transferts tant
+// que le fichier WIFI_OFF_FLAG existe.
+#define WIFI_OFF_FLAG "/tmp/jellysync-emu-wifi-off"
+std::atomic<bool> g_wifi(true);
+int               g_wifi_pings = 0;
+
+struct Timer { std::string name; iv_timerproc proc; Uint32 due; };
+std::vector<Timer> g_timers;
 
 // ─── Utilitaires ──────────────────────────────────────────────────────────────
 
@@ -196,9 +212,11 @@ void ink_update(int x, int y, int w, int h)
 {
     SDL_Rect r{x, y, w, h}, scr{0, 0, g_sw, g_sh}, out;
     if (!SDL_IntersectRect(&r, &scr, &out)) { present(); return; }
+    // Barre d'état active : l'image est décalée de sa hauteur, avec retour en haut
+    int off = (g_panel_type != PANEL_DISABLED && !(g_panel_type & PANEL_NO_FB_OFFSET)) ? g_panel_h : 0;
     for (int j = out.y; j < out.y + out.h; ++j) {
         Uint32* src = (Uint32*)((Uint8*)g_fb->pixels + j * g_fb->pitch);
-        Uint32* dst = (Uint32*)((Uint8*)g_display->pixels + j * g_display->pitch);
+        Uint32* dst = (Uint32*)((Uint8*)g_display->pixels + ((j + off) % g_sh) * g_display->pitch);
         for (int i = out.x; i < out.x + out.w; ++i) {
             Uint8 r8, g8, b8;
             SDL_GetRGB(src[i], g_fb->format, &r8, &g8, &b8);
@@ -213,6 +231,25 @@ void ink_update(int x, int y, int w, int h)
 void dispatch(int type, int p1, int p2)
 {
     if (g_handler) g_handler(type, p1, p2);
+}
+
+void set_wifi(bool on)
+{
+    g_wifi = on;
+    if (on) remove(WIFI_OFF_FLAG);
+    else if (FILE* f = fopen(WIFI_OFF_FLAG, "w")) fclose(f);
+}
+
+void run_timers()
+{
+    Uint32 now = SDL_GetTicks();
+    for (size_t i = 0; i < g_timers.size(); ++i) {
+        if ((Sint32)(now - g_timers[i].due) < 0) continue;
+        iv_timerproc p = g_timers[i].proc;
+        g_timers.erase(g_timers.begin() + i);
+        p();   // peut se réarmer
+        return;
+    }
 }
 
 void drain_queue()
@@ -333,6 +370,12 @@ void handle_sdl_event(const SDL_Event& ev)
                 break;
             }
             if (ev.key.keysym.sym == SDLK_F5) { dispatch(EVT_REPAINT, 0, 0); break; }
+            if (ev.key.keysym.sym == SDLK_F9) {
+                set_wifi(!g_wifi);
+                fprintf(stderr, "[emu] Wi-Fi %s\n", g_wifi ? "rétabli" : "coupé");
+                dispatch(g_wifi ? EVT_NET_CONNECTED : EVT_NET_DISCONNECTED, 0, 0);
+                break;
+            }
             int k = map_key(ev.key.keysym.sym);
             if (k) dispatch(ev.key.repeat ? EVT_KEYREPEAT : EVT_KEYPRESS, k, 0);
             break;
@@ -390,6 +433,8 @@ void InkViewMain(iv_handler h)
         if (sscanf(s, "%dx%d", &w, &hh) == 2 && w > 0 && hh > 0) { g_sw = w; g_sh = hh; }
     }
     g_shot_path = getenv("JELLYSYNC_SHOT");
+    { const char* s = getenv("JELLYSYNC_WIFI"); set_wifi(!(s && strcmp(s, "off") == 0)); }
+    if (const char* s = getenv("JELLYSYNC_PANEL_H")) g_panel_h = atoi(s);
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "[emu] SDL_Init : %s\n", SDL_GetError());
@@ -443,6 +488,7 @@ void InkViewMain(iv_handler h)
             while (!g_quit && SDL_PollEvent(&ev)) handle_sdl_event(ev);
         }
         drain_queue();
+        run_timers();
     }
 
     dispatch(EVT_EXIT, 0, 0);
@@ -654,6 +700,40 @@ void OpenKeyboard(const char* title, char* buffer, int maxlen, int flags,
     g_kb.cb       = hproc;
     SDL_StartTextInput();
     present();
+}
+
+void SetPanelType(int type) { g_panel_type = type; }
+int  PanelHeight(void) { return g_panel_type == PANEL_DISABLED ? 0 : g_panel_h; }
+
+void SetHardTimer(const char* name, iv_timerproc tproc, int ms)
+{
+    for (auto& t : g_timers)
+        if (t.name == name) { t.proc = tproc; t.due = SDL_GetTicks() + ms; return; }
+    g_timers.push_back({ name, tproc, SDL_GetTicks() + (Uint32)ms });
+}
+
+void ClearTimer(iv_timerproc tproc)
+{
+    g_timers.erase(std::remove_if(g_timers.begin(), g_timers.end(),
+                   [&](const Timer& t) { return t.proc == tproc; }), g_timers.end());
+}
+
+int QueryNetwork(void) { return g_wifi ? (NET_WIFI | NET_CONNECTED) : NET_WIFI; }
+
+int NetConnect(const char* name)
+{
+    (void)name;
+    fprintf(stderr, "[emu] NetConnect : connexion au Wi-Fi...\n");
+    SDL_Delay(1000);
+    set_wifi(true);
+    return NET_OK;
+}
+
+int NetMgrPing(void)
+{
+    ++g_wifi_pings;
+    fprintf(stderr, "[emu] NetMgrPing (%d)\n", g_wifi_pings);
+    return 0;
 }
 
 } // extern "C"

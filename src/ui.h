@@ -80,6 +80,7 @@ struct TouchZone { int x, y, w, h, id; };
 #define ZONE_BTN_SETTINGS      3
 #define ZONE_BTN_DL_SELECTED   4
 #define ZONE_BTN_CLEAR_SEL     5
+#define ZONE_BTN_RECONNECT     7
 #define ZONE_BTN_DL_FOLDER     6
 #define ZONE_FILTER_BASE      10   // + 0..2
 #define ZONE_PAGE_PREV        20
@@ -565,7 +566,10 @@ static void draw_screen_folders(AppConfig* cfg, AppState* state)
                                             "%d books on the server · %d on device"),
                  state->total_remote, state->local_book_count);
     }
-    draw_banner(title, detail, nullptr, 0, err);
+    // Serveur injoignable : proposer de relancer le Wi-Fi
+    bool offline = err && !state->server_connected && cfg->server_url[0];
+    draw_banner(title, detail, offline ? tr("Reconnecter le Wi-Fi", "Reconnect Wi-Fi") : nullptr,
+                ZONE_BTN_RECONNECT, err);
 
     if (!state->catalog_loaded) {
         g_list_total = 0;
@@ -783,7 +787,10 @@ static void draw_screen_syncing(AppConfig* cfg, AppState* state)
 
     char step[160];
     bool dl = state->bg_mode != BG_CATALOG;
-    if (dl && state->dl_total > 0)
+    if (state->wifi_reconnecting)
+        snprintf(step, sizeof(step), "%s", tr("Wi-Fi perdu, reconnexion en cours...",
+                                              "Wi-Fi lost, reconnecting..."));
+    else if (dl && state->dl_total > 0)
         snprintf(step, sizeof(step), tr("Livre %d sur %d", "Book %d of %d"),
                  std::max(1, state->dl_index), state->dl_total);
     else
@@ -1038,6 +1045,7 @@ static void open_keyboard(char* target, int max_len, const char* title, bool pas
 static void ui_handle_tap(int px, int py,
                           AppConfig* cfg, AppState* state,
                           std::function<void()> on_refresh,
+                          std::function<void()> on_reconnect,
                           std::function<void(int)> on_download_one,
                           std::function<void(const std::string&)> on_download_folder,
                           std::function<void()> on_download_selected)
@@ -1102,6 +1110,9 @@ static void ui_handle_tap(int px, int py,
         case ZONE_BTN_REFRESH:
             state->error_msg[0] = 0;
             on_refresh();
+            break;
+        case ZONE_BTN_RECONNECT:
+            on_reconnect();
             break;
         case ZONE_BTN_DL_FOLDER:
             state->error_msg[0] = 0;
