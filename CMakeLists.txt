@@ -48,7 +48,7 @@ add_compile_definitions(
     USERDATA="/mnt/ext1/system"
     CONFIG_FILE="/mnt/ext1/system/config/jellysync.cfg"
     BOOKS_DIR="/mnt/ext1/books/Jellyfin"
-    APP_VERSION="1.0.1"
+    APP_VERSION="1.1.0"
     JELLYFIN_API_IMPL
 )
 

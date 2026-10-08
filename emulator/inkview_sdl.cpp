@@ -21,6 +21,7 @@
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <SDL_ttf.h>
+#include <png.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -700,6 +701,56 @@ void OpenKeyboard(const char* title, char* buffer, int maxlen, int flags,
     g_kb.cb       = hproc;
     SDL_StartTextInput();
     present();
+}
+
+// ─── Images ───────────────────────────────────────────────────────────────────
+
+ibitmap* LoadPNGStretch(const char* path, int width, int height, int proportional, int dither)
+{
+    (void)dither;
+    png_image img;
+    memset(&img, 0, sizeof(img));
+    img.version = PNG_IMAGE_VERSION;
+    if (!png_image_begin_read_from_file(&img, path)) return nullptr;
+    img.format = PNG_FORMAT_GRAY;
+    std::vector<unsigned char> src(PNG_IMAGE_SIZE(img));
+    if (!png_image_finish_read(&img, nullptr, src.data(), 0, nullptr)) {
+        png_image_free(&img);
+        return nullptr;
+    }
+    int sw = (int)img.width, sh = (int)img.height;
+    if (sw <= 0 || sh <= 0) return nullptr;
+
+    int dw = width > 0 ? width : sw, dh = height > 0 ? height : sh;
+    if (proportional) {
+        if ((long long)sw * dh > (long long)sh * dw) dh = std::max(1, sh * dw / sw);
+        else                                          dw = std::max(1, sw * dh / sh);
+    }
+    ibitmap* b = (ibitmap*)malloc(sizeof(ibitmap) + (size_t)dw * dh);
+    if (!b) return nullptr;
+    b->width = dw; b->height = dh; b->depth = 8; b->scanline = dw;
+    // Réduction par moyenne des pixels sources couverts
+    for (int y = 0; y < dh; ++y) {
+        int y0 = y * sh / dh, y1 = std::max(y0 + 1, (y + 1) * sh / dh);
+        for (int x = 0; x < dw; ++x) {
+            int x0 = x * sw / dw, x1 = std::max(x0 + 1, (x + 1) * sw / dw);
+            unsigned sum = 0, n = 0;
+            for (int yy = y0; yy < y1 && yy < sh; ++yy)
+                for (int xx = x0; xx < x1 && xx < sw; ++xx) { sum += src[yy * sw + xx]; ++n; }
+            b->data[y * dw + x] = (unsigned char)(n ? sum / n : 255);
+        }
+    }
+    return b;
+}
+
+void DrawBitmap(int x, int y, const ibitmap* b)
+{
+    if (!b || b->depth != 8) return;
+    for (int j = 0; j < b->height; ++j)
+        for (int i = 0; i < b->width; ++i) {
+            int v = b->data[j * b->scanline + i];
+            put_pixel(x + i, y + j, map_rgb(g_fb, (v << 16) | (v << 8) | v));
+        }
 }
 
 void SetPanelType(int type) { g_panel_type = type; }

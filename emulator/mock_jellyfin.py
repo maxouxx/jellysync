@@ -9,17 +9,26 @@ Dans l'app : URL = http://127.0.0.1:8096, utilisateur/mot de passe quelconques
 Un catalogue d'environ 60 livres répartis en dossiers est servi ; chaque
 téléchargement renvoie un petit fichier factice, envoyé lentement pour voir
 la barre de progression. Les requêtes Range (reprise) sont acceptées.
+Couvertures (/Items/<id>/Images/Primary) : générées en PNG si Pillow est
+installé ; un livre sur neuf n'en a pas, pour voir le cadre de remplacement.
 
 Wi-Fi simulé : tant que /tmp/jellysync-emu-wifi-off existe (touche F9 dans
 l'émulateur), le serveur ne répond plus et coupe les transferts en cours.
 """
 
+import io
 import json
 import os
+import textwrap
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:  # sans Pillow : pas de couvertures
+    Image = None
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8096
 USER_ID = "u-0001"
@@ -53,9 +62,36 @@ for folder, titles in AUTHORS.items():
             "Path": f"/media/livres/{folder}/{t}{ext}",
             "MediaSources": [{"Size": size}], "Size": size,
         })
+        if Image and len(BOOKS) % 9 != 5:
+            BOOKS[-1]["ImageTags"] = {"Primary": f"tag{bid}"}
 BY_ID = {b["Id"]: b for b in BOOKS}
 WIFI_OFF_FLAG = "/tmp/jellysync-emu-wifi-off"
 DELAY = float(os.environ.get("MOCK_DELAY", "0.01"))  # pause entre deux blocs de 4 Ko
+
+
+FONT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "DejaVuSans-Bold.ttf")
+
+
+def make_cover(book, max_w, max_h):
+    """Couverture factice 2:3 : fond uni, cadre et titre."""
+    w, h = 400, 600
+    shade = 40 + (int(book["Id"][1:]) * 37) % 160
+    img = Image.new("RGB", (w, h), (shade, shade // 2 + 60, 200 - shade // 2))
+    d = ImageDraw.Draw(img)
+    d.rectangle([20, 20, w - 21, h - 21], outline=(255, 255, 255), width=8)
+    try:
+        font = ImageFont.truetype(FONT, 60)
+    except OSError:
+        font = ImageFont.load_default()
+    y = 80
+    for line in textwrap.wrap(book["Name"], 10)[:7]:
+        d.text((44, y), line, fill=(255, 255, 255), font=font)
+        y += 74
+    if max_w or max_h:
+        img.thumbnail((max_w or w, max_h or h))
+    out = io.BytesIO()
+    img.save(out, "PNG")
+    return out.getvalue()
 
 
 def wifi_off():
@@ -113,6 +149,17 @@ class Handler(BaseHTTPRequestHandler):
             limit = int(q.get("limit", ["500"])[0])
             return self._json({"TotalRecordCount": len(BOOKS),
                                "Items": BOOKS[start:start + limit]})
+        if p.startswith("/Items/") and p.endswith("/Images/Primary"):
+            book = BY_ID.get(p.split("/")[2])
+            if not book or "ImageTags" not in book:
+                return self._json({"error": "not found"}, 404)
+            data = make_cover(book, int(q.get("maxWidth", ["0"])[0]), int(q.get("maxHeight", ["0"])[0]))
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if p.startswith("/Items/") and p.endswith("/Download"):
             book = BY_ID.get(p.split("/")[2])
             if not book:

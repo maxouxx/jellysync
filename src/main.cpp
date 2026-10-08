@@ -240,6 +240,7 @@ int main(void)
 
     InkViewMain(main_handler);
 
+    covers_free_bitmaps();
     cleanup_fonts();
     curl_global_cleanup();
     log_close();
@@ -300,6 +301,13 @@ static int main_handler(int event, int par1, int par2)
                 net_reconnect_request();
                 return 1;
             }
+            if (par1 == MSG_COVER_READY) {
+                // Vignettes arrivées : seule la liste est redessinée
+                if (!g_state.syncing && g_state.screen == SCREEN_MAIN &&
+                    g_state.in_folder && g_config.show_covers)
+                    ui_draw_region(&g_config, &g_state, list_top(), list_bottom());
+                return 1;
+            }
             if (par1 == MSG_SYNC_PROGRESS || par1 == MSG_DOWNLOAD_PROGRESS) {
                 g_state.progress = par2;
                 ui_progress(&g_config, &g_state);
@@ -310,6 +318,8 @@ static int main_handler(int event, int par1, int par2)
                 pthread_join(g_thread, nullptr);
                 g_state.syncing  = false;
                 g_state.progress = 100;
+                if (par1 == MSG_CATALOG_READY)
+                    covers_set_server(g_config.server_url, g_state.token);
                 if (par1 == MSG_CATALOG_READY || par1 == MSG_CATALOG_ERROR) {
                     g_state.in_folder   = false;
                     g_state.list_scroll = 0;
