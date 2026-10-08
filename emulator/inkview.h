@@ -34,6 +34,8 @@ extern "C" {
 #define EVT_POINTERDOWN   30
 #define EVT_POINTERMOVE   31
 #define EVT_REPAINT       91
+#define EVT_NET_CONNECTED    256
+#define EVT_NET_DISCONNECTED 257
 
 // ─── Touches ──────────────────────────────────────────────────────────────────
 #define IV_KEY_POWER      0x01
@@ -57,6 +59,18 @@ extern "C" {
 #define KBD_NORMAL        0
 #define KBD_PASSWORD      0x1000
 
+// ─── Réseau ───────────────────────────────────────────────────────────────────
+#define NET_WIFI          0x0002
+#define NET_WIFIREADY     0x0200
+#define NET_CONNECTED     0x0f00
+#define NET_OK            0
+#define NET_FAIL          -11
+
+// ─── Barre d'état du système ─────────────────────────────────────────────────
+#define PANEL_DISABLED      0
+#define PANEL_ENABLED       (1 << 1)
+#define PANEL_NO_FB_OFFSET  (1 << 3)
+
 // ─── Polices ──────────────────────────────────────────────────────────────────
 enum iv_fonttype { FONT_STD = 0, FONT_BOLD, FONT_ITALIC, FONT_BOLDITALIC, FONT_MONO };
 
@@ -73,6 +87,7 @@ typedef struct ifont_s {
 
 typedef int  (*iv_handler)(int type, int par1, int par2);
 typedef void (*iv_keyboardhandler)(char* text);
+typedef void (*iv_timerproc)(void);
 
 // ─── API ──────────────────────────────────────────────────────────────────────
 void InkViewMain(iv_handler h);
@@ -101,6 +116,20 @@ void SendEventTo(int task, int type, int par1, int par2);
 
 void OpenKeyboard(const char* title, char* buffer, int maxlen, int flags,
                   iv_keyboardhandler hproc);
+
+// Barre d'état : tant qu'elle est active, l'affichage est décalé de sa hauteur
+// vers le bas (le bas de l'image réapparaît en haut), comme sur la liseuse.
+void SetPanelType(int type);
+int  PanelHeight(void);
+
+void SetHardTimer(const char* name, iv_timerproc tproc, int ms);
+void ClearTimer(iv_timerproc tproc);
+
+// Wi-Fi simulé : F9 coupe / rétablit la connexion ; JELLYSYNC_WIFI=off au
+// démarrage. NetConnect() le rétablit au bout d'une seconde.
+int  QueryNetwork(void);
+int  NetConnect(const char* name);
+int  NetMgrPing(void);
 
 #ifdef __cplusplus
 }

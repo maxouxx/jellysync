@@ -129,17 +129,26 @@ static std::string local_path_for(const AppConfig* cfg, const BookEntry& e)
 }
 
 // ─── Authentification réutilisable ────────────────────────────────────────────
-static JFResult sync_authenticate(AppConfig* cfg, AppState* state, JellyfinClient& client)
+static JFResult sync_authenticate_once(AppConfig* cfg, JellyfinClient& client)
 {
-    JFResult r;
     if (cfg->auth_mode == 1) {
         log_write("Authentification par clé API sur %s\n", cfg->server_url);
-        r = jf_set_api_key(client, cfg->server_url, cfg->api_key);
-    } else {
-        log_write("Authentification de « %s » sur %s\n", cfg->username, cfg->server_url);
-        r = jf_authenticate(client, cfg->server_url, cfg->username, cfg->password);
+        return jf_set_api_key(client, cfg->server_url, cfg->api_key);
     }
+    log_write("Authentification de « %s » sur %s\n", cfg->username, cfg->server_url);
+    return jf_authenticate(client, cfg->server_url, cfg->username, cfg->password);
+}
 
+static JFResult sync_authenticate(AppConfig* cfg, AppState* state, JellyfinClient& client)
+{
+    JFResult r = sync_authenticate_once(cfg, client);
+    // Wi-Fi tombé entre-temps : on le relance et on réessaie
+    for (int attempt = 0; r == JF_ERR_NETWORK && attempt < 2; ++attempt) {
+        log_write("Serveur injoignable, vérification du Wi-Fi\n");
+        net_ensure("connexion au serveur");
+        sleep(2);
+        r = sync_authenticate_once(cfg, client);
+    }
     if (r == JF_OK) {
         strncpy(state->token,   client.token.c_str(),   sizeof(state->token)-1);
         strncpy(state->user_id, client.user_id.c_str(), sizeof(state->user_id)-1);
@@ -399,7 +408,8 @@ static int sync_run(SyncContext* ctx)
     AppConfig* cfg   = ctx->config;
     AppState*  state = ctx->state;
 
-    // Disable WiFi power management before any network activity.
+    // Wi-Fi connecté (reconnexion si besoin) et sans mise en veille
+    net_ensure(ctx->mode == BG_CATALOG ? "chargement de la bibliothèque" : "téléchargement");
     wifi_keepalive();
 
     if (ctx->mode == BG_CATALOG)

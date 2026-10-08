@@ -10,6 +10,8 @@
 #include <inkview.h>
 #include <curl/curl.h>
 #include <pthread.h>
+#include <dlfcn.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <cstdio>
 #include <cstdlib>
@@ -99,9 +101,119 @@ static AppConfig  g_config;
 static AppState   g_state;
 static pthread_t  g_thread;
 
+// ─── Wi-Fi ────────────────────────────────────────────────────────────────────
+// La liseuse coupe le Wi-Fi après quelques minutes sans activité « système »
+// (les transferts curl ne comptent pas) et il lui arrive de décrocher.
+//   • Toutes les 30 s, tant que l'application est ouverte, on signale au
+//     gestionnaire réseau que la connexion sert (NetMgrPing) et on désactive
+//     l'économie d'énergie de la puce.
+//   • Avant chaque accès au serveur, et après chaque coupure en cours de
+//     téléchargement, on vérifie le Wi-Fi et on le reconnecte si besoin.
+//   • Un bouton « Reconnecter le Wi-Fi » apparaît quand le serveur est injoignable.
+#define MSG_NET_RECONNECT 0x20
+static const int WIFI_TICK_MS = 30000;
+
+static pthread_t       g_main_thread;
+static pthread_mutex_t g_net_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_net_cond  = PTHREAD_COND_INITIALIZER;
+static bool            g_net_waiting = false;
+static bool            g_net_result  = false;
+static const char*     g_net_why     = "";
+
+static bool wifi_up()
+{
+    return (QueryNetwork() & NET_CONNECTED) != 0;
+}
+
+// NetMgrPing n'existe pas dans tous les firmwares : résolu à l'exécution
+static void wifi_ping()
+{
+#ifdef INKVIEW_EMU_H
+    NetMgrPing();
+#else
+    typedef int (*ping_fn)(void);
+    static ping_fn fn = (ping_fn)dlsym(RTLD_DEFAULT, "NetMgrPing");
+    if (fn) fn();
+#endif
+}
+
+// Thread principal uniquement : NetConnect affiche au besoin la fenêtre de
+// connexion du système et bloque jusqu'au résultat.
+static bool wifi_connect_ui(const char* why)
+{
+    if (wifi_up()) return true;
+    log_write("Wi-Fi déconnecté (%s), reconnexion...\n", why);
+    for (int attempt = 1; attempt <= 2; ++attempt) {
+        int r = NetConnect(NULL);
+        if (r == NET_OK && wifi_up()) {
+            log_write("Wi-Fi reconnecté\n");
+            wifi_keepalive();
+            wifi_ping();
+            return true;
+        }
+        log_write("Reconnexion Wi-Fi échouée (code %d, essai %d/2)\n", r, attempt);
+    }
+    return false;
+}
+
+// Appelable depuis n'importe quel thread (déclarée dans jellyfin_api.h)
+bool net_ensure(const char* why)
+{
+    if (wifi_up()) { wifi_ping(); return true; }
+    if (pthread_equal(pthread_self(), g_main_thread)) return wifi_connect_ui(why);
+
+    // Thread de fond : le thread principal se charge de la reconnexion
+    pthread_mutex_lock(&g_net_mutex);
+    g_net_waiting = true;
+    g_net_result  = false;
+    g_net_why     = why;
+    pthread_mutex_unlock(&g_net_mutex);
+    SendEvent(GetCurrentTask(), EVT_CUSTOM, MSG_NET_RECONNECT, 0);
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 120;
+    pthread_mutex_lock(&g_net_mutex);
+    while (g_net_waiting)
+        if (pthread_cond_timedwait(&g_net_cond, &g_net_mutex, &deadline) != 0) break;
+    g_net_waiting = false;
+    bool ok = g_net_result;
+    pthread_mutex_unlock(&g_net_mutex);
+    return ok;
+}
+
+static void net_reconnect_request()
+{
+    pthread_mutex_lock(&g_net_mutex);
+    const char* why = g_net_why;
+    pthread_mutex_unlock(&g_net_mutex);
+
+    g_state.wifi_reconnecting = true;
+    ui_draw(&g_config, &g_state);
+    bool ok = wifi_connect_ui(why);
+    g_state.wifi_reconnecting = false;
+    ui_draw(&g_config, &g_state);
+
+    pthread_mutex_lock(&g_net_mutex);
+    g_net_result  = ok;
+    g_net_waiting = false;
+    pthread_cond_broadcast(&g_net_cond);
+    pthread_mutex_unlock(&g_net_mutex);
+}
+
+static void wifi_tick()
+{
+    if (wifi_up()) {
+        wifi_ping();
+        wifi_keepalive();
+    }
+    SetHardTimer("jellysync-wifi", wifi_tick, WIFI_TICK_MS);
+}
+
 // ─── Prototypes ───────────────────────────────────────────────────────────────
 static int  main_handler(int event, int par1, int par2);
 static void start_background(BgMode mode);
+static void manual_reconnect();
 static void start_download_one(int catalog_idx);
 static void start_download_folder(const std::string& folder);
 static void start_download_selected();
@@ -111,6 +223,7 @@ static void* bg_thread_func(void* arg);
 int main(void)
 {
     log_init();
+    g_main_thread = pthread_self();
     curl_global_init(CURL_GLOBAL_ALL);
 
     mkdir(FLASHDIR "/books", 0755);
@@ -139,6 +252,11 @@ static int main_handler(int event, int par1, int par2)
     switch (event)
     {
         case EVT_INIT:
+            // Plein écran : sans cela, le firmware réserve la place de sa barre
+            // d'état et décale tout l'affichage vers le bas (le bas de l'écran
+            // réapparaît en haut).
+            SetPanelType(PANEL_DISABLED);
+            wifi_tick();
             ui_init(&g_config, &g_state);
             if (g_state.screen == SCREEN_SETUP) g_cfg_backup = g_config;
             ui_draw(&g_config, &g_state);
@@ -147,6 +265,10 @@ static int main_handler(int event, int par1, int par2)
             return 1;
 
         case EVT_SHOW:
+            SetPanelType(PANEL_DISABLED);
+            ui_draw(&g_config, &g_state);
+            return 1;
+
         case EVT_REPAINT:
             ui_draw(&g_config, &g_state);
             return 1;
@@ -154,6 +276,7 @@ static int main_handler(int event, int par1, int par2)
         case EVT_POINTERUP:
             ui_handle_tap(par1, par2, &g_config, &g_state,
                 []{ start_background(BG_CATALOG); },
+                []{ manual_reconnect(); },
                 [](int idx){ start_download_one(idx); },
                 [](const std::string& f){ start_download_folder(f); },
                 []{ start_download_selected(); });
@@ -168,7 +291,15 @@ static int main_handler(int event, int par1, int par2)
             else if (par1 == KEY_NEXT) ui_page(&g_config, &g_state, +1);
             return 1;
 
+        case EVT_EXIT:
+            ClearTimer(wifi_tick);
+            return 1;
+
         case EVT_CUSTOM:
+            if (par1 == MSG_NET_RECONNECT) {
+                net_reconnect_request();
+                return 1;
+            }
             if (par1 == MSG_SYNC_PROGRESS || par1 == MSG_DOWNLOAD_PROGRESS) {
                 g_state.progress = par2;
                 ui_progress(&g_config, &g_state);
@@ -213,6 +344,24 @@ static void start_background(BgMode mode)
     if (g_state.syncing) return;
     log_write("Chargement de la bibliothèque\n");
     begin_background(mode, "Connexion...");
+}
+
+// Bouton « Reconnecter le Wi-Fi » : reconnexion puis rechargement
+static void manual_reconnect()
+{
+    if (g_state.syncing) return;
+    log_write("Reconnexion demandée\n");
+    snprintf(g_state.status_msg, sizeof(g_state.status_msg), "%s",
+             g_config.lang == 1 ? "Reconnecting Wi-Fi..." : "Reconnexion du Wi-Fi...");
+    if (wifi_connect_ui("bouton Reconnecter")) {
+        g_state.error_msg[0] = 0;
+        start_background(BG_CATALOG);
+    } else {
+        snprintf(g_state.error_msg, sizeof(g_state.error_msg), "%s",
+                 g_config.lang == 1 ? "Wi-Fi unavailable. Check the network and try again."
+                                    : "Wi-Fi indisponible. Vérifiez le réseau puis réessayez.");
+        ui_draw(&g_config, &g_state);
+    }
 }
 
 static void start_download_one(int catalog_idx)
