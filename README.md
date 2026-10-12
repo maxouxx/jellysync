@@ -4,6 +4,46 @@ Synchroniseur de bibliothèque Jellyfin pour liseuse Vivlio Inkpad 3.
 
 ---
 
+## Aperçu
+
+Captures prises avec l'émulateur PC (`./emulator/run.sh --mock`), à la résolution
+de l'InkPad 3 (1404×1872).
+
+### 1. Premier lancement : se connecter au serveur
+
+Saisie de l'adresse Jellyfin et des identifiants, puis la bibliothèque s'affiche
+par dossier avec le nombre de nouveaux livres.
+
+| Réglages | Accueil |
+|:---:|:---:|
+| <img src="screenshots/01-reglages.png" width="260" alt="Réglages : serveur, identifiants, langue, vignettes"> | <img src="screenshots/02-accueil.png" width="260" alt="Accueil : liste des dossiers et nouveaux livres"> |
+
+### 2. Choisir quelques livres et les télécharger
+
+On ouvre un dossier, on coche les livres voulus, puis **Télécharger**. Les livres
+récupérés passent dans l'onglet **Sur la liseuse**.
+
+| Dossier | Sélection | Après le téléchargement | Sur la liseuse |
+|:---:|:---:|:---:|:---:|
+| <img src="screenshots/03-dossier.png" width="190" alt="Contenu du dossier Jules Verne"> | <img src="screenshots/04-selection.png" width="190" alt="Trois livres cochés, barre Télécharger"> | <img src="screenshots/05-apres-telechargement.png" width="190" alt="Livres téléchargés marqués d'une coche"> | <img src="screenshots/06-sur-la-liseuse.png" width="190" alt="Onglet Sur la liseuse"> |
+
+### 3. Tout télécharger d'un dossier
+
+**Tout télécharger** récupère tous les nouveaux livres du dossier, avec la
+progression et le journal détaillé en bas de l'écran.
+
+| Dossier | Téléchargement en cours | Dossier à jour |
+|:---:|:---:|:---:|
+| <img src="screenshots/07-dossier-bd.png" width="230" alt="Dossier Astérix, 5 nouveaux livres"> | <img src="screenshots/08-progression.png" width="230" alt="Progression : livre 2 sur 5, 47 %"> | <img src="screenshots/09-dossier-a-jour.png" width="230" alt="Dossier à jour, 5 livres sur la liseuse"> |
+
+### 4. Interface en anglais
+
+| Settings | Home |
+|:---:|:---:|
+| <img src="screenshots/10-settings-english.png" width="260" alt="Settings in English"> | <img src="screenshots/11-home-english.png" width="260" alt="Home screen in English"> |
+
+---
+
 ## Compilation sur Windows 10 (WSL2)
 
 ### Étape 1 — Installer WSL2
@@ -179,6 +219,7 @@ Le fichier `/mnt/ext1/jellysync.log` sera lisible via USB.
 JellySync/
 ├── CMakeLists.txt
 ├── emulator/             # Build PC : InkView simulé (SDL2), faux Jellyfin
+├── screenshots/          # Captures d'écran du README
 ├── .github/workflows/build.yml
 └── src/
     ├── main.cpp          # Point d'entrée + boucle événements
